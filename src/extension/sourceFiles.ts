@@ -614,15 +614,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       'input[value*="Complete" i]',
     ],
     captcha: [
-      'iframe[src*="recaptcha"]',
-      'iframe[src*="turnstile"]',
-      'iframe[src*="hcaptcha"]',
-      '.g-recaptcha',
-      '.cf-turnstile',
-      '#turnstile-wrapper',
-      '#recaptcha',
-      '[id*="captcha"]',
-      '[class*="captcha"]',
+      '#cf-challenge-running',
+      '#challenge-running',
     ],
   };
 
@@ -677,14 +670,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   function checkForCaptcha() {
-    for (const selector of SCAN_SELECTORS.captcha) {
-      const el = document.querySelector(selector);
-      if (el && el.offsetParent !== null) {
-        return {
-          captchaDetected: true,
-          captchaType: selector.includes('turnstile') ? 'Cloudflare Turnstile' : 'reCAPTCHA / Security Challenge',
-        };
-      }
+    const blockingSelectors = [
+      '#cf-challenge-running',
+      '#challenge-running',
+    ];
+    for (const selector of blockingSelectors) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && el.offsetWidth > 100 && el.offsetHeight > 50) {
+          return {
+            captchaDetected: true,
+            captchaType: 'Cloudflare Challenge',
+          };
+        }
+      } catch (e) {}
     }
     return { captchaDetected: false };
   }

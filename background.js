@@ -204,54 +204,46 @@ Respond ONLY with a valid JSON object in this exact schema:
   return parsed;
 }
 
+let isLoopRunning = false;
+
 /**
  * Main Autonomous Automation Loop (Works in background even if user is in another tab!)
  */
 async function runAutomationLoop(tabId) {
+  if (isLoopRunning) {
+    log('info', 'Automation loop is already active.');
+    return;
+  }
+
+  isLoopRunning = true;
   sessionState.status = 'RUNNING';
   broadcastState();
 
   let loopIterations = 0;
   const MAX_ITERATIONS = 500;
 
-  while (sessionState.status === 'RUNNING' && loopIterations < MAX_ITERATIONS) {
-    loopIterations++;
+  try {
+    while (sessionState.status === 'RUNNING' && loopIterations < MAX_ITERATIONS) {
+      loopIterations++;
 
-    try {
-      // 1. Verify target tab exists (even if backgrounded)
       try {
-        const tab = await chrome.tabs.get(tabId);
-        if (!tab) {
-          log('warn', 'Target tab not accessible. Stopping.');
+        // 1. Verify target tab exists (even if backgrounded)
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (!tab) {
+            log('warn', 'Target tab not accessible. Stopping.');
+            resetSession('IDLE');
+            break;
+          }
+        } catch (e) {
+          log('warn', 'Target tab lost. Stopping.');
           resetSession('IDLE');
-          return;
+          break;
         }
-      } catch (e) {
-        log('warn', 'Target tab lost. Stopping.');
-        resetSession('IDLE');
-        return;
-      }
 
-      // 2. Check for security challenge or captcha
-      let captchaCheck;
-      try {
-        captchaCheck = await chrome.tabs.sendMessage(tabId, { type: 'CHECK_CAPTCHA' });
-      } catch (e) {
-        // Tab may be reloading or executing script
-        await new Promise((r) => setTimeout(r, 1000));
-        continue;
-      }
-
-      if (captchaCheck?.captchaDetected) {
-        sessionState.status = 'PAUSED_CAPTCHA';
-        log('warn', `Security Challenge detected (${captchaCheck.captchaType}). Automation paused for user completion.`);
+        // 2. Scan DOM for questions & navigation
+        sessionState.status = 'SCANNING';
         broadcastState();
-        return;
-      }
-
-      // 3. Scan DOM for questions & navigation
-      sessionState.status = 'SCANNING';
-      broadcastState();
 
       let scanResult;
       try {
@@ -440,10 +432,13 @@ async function runAutomationLoop(tabId) {
         return;
       }
     } catch (loopErr) {
-      log('error', `Automation loop error: ${loopErr.message}`);
+      log('error', `Automation step: ${loopErr.message}`);
       await new Promise((r) => setTimeout(r, 1500));
     }
   }
+} finally {
+  isLoopRunning = false;
+}
 }
 
 // Message Dispatcher
@@ -476,6 +471,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ success: false, error: 'No active tab found' });
           return;
         }
+        await hydrateConfig();
         const activeTab = tabs[0];
         sessionState.targetTabId = activeTab.id;
         sessionState.targetTabInfo = {
@@ -502,26 +498,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case 'PAUSE_AUTOMATION':
-      if (sessionState.status !== 'IDLE' && sessionState.status !== 'COMPLETED') {
-        sessionState.status = 'PAUSED';
-        log('warn', 'Automation paused by user.');
-        broadcastState();
-      }
+      sessionState.status = 'PAUSED';
+      isLoopRunning = false;
+      log('warn', 'Automation paused by user.');
+      broadcastState();
       sendResponse({ success: true });
       break;
 
     case 'RESUME_AUTOMATION':
-      if (sessionState.targetTabId && (sessionState.status === 'PAUSED' || sessionState.status === 'PAUSED_CAPTCHA')) {
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        await hydrateConfig();
+        const targetId = sessionState.targetTabId || tabs?.[0]?.id;
+        if (!targetId) {
+          sendResponse({ success: false, error: 'No tab found to resume' });
+          return;
+        }
+        sessionState.targetTabId = targetId;
         sessionState.status = 'RUNNING';
         log('info', 'Automation resumed.');
         broadcastState();
-        runAutomationLoop(sessionState.targetTabId);
-      }
-      sendResponse({ success: true });
-      break;
+
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: targetId },
+            files: ['content.js'],
+          });
+        } catch (e) {}
+
+        runAutomationLoop(targetId);
+        sendResponse({ success: true });
+      });
+      return true;
 
     case 'STOP_AUTOMATION':
       log('info', 'Automation stopped and session reset.');
+      isLoopRunning = false;
       resetSession('IDLE');
       sendResponse({ success: true });
       break;

@@ -82,15 +82,8 @@
       'input[value*="Complete" i]',
     ],
     captcha: [
-      'iframe[src*="recaptcha"]',
-      'iframe[src*="turnstile"]',
-      'iframe[src*="hcaptcha"]',
-      '.g-recaptcha',
-      '.cf-turnstile',
-      '#turnstile-wrapper',
-      '#recaptcha',
-      '[id*="captcha"]',
-      '[class*="captcha"]',
+      '#cf-challenge-running',
+      '#challenge-running',
     ],
   };
 
@@ -145,14 +138,21 @@
   }
 
   function checkForCaptcha() {
-    for (const selector of SCAN_SELECTORS.captcha) {
-      const el = document.querySelector(selector);
-      if (el) {
-        return {
-          captchaDetected: true,
-          captchaType: selector.includes('turnstile') ? 'Cloudflare Turnstile' : 'reCAPTCHA / Security Challenge',
-        };
-      }
+    // Only detect if an active visible modal challenge is present
+    const blockingSelectors = [
+      '#cf-challenge-running',
+      '#challenge-running',
+    ];
+    for (const selector of blockingSelectors) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && el.offsetWidth > 100 && el.offsetHeight > 50) {
+          return {
+            captchaDetected: true,
+            captchaType: 'Cloudflare Challenge',
+          };
+        }
+      } catch (e) {}
     }
     return { captchaDetected: false };
   }
@@ -229,7 +229,8 @@
 
     if (filtered.length > 0) return filtered;
 
-    const allDivs = Array.from(document.querySelectorAll('div, section, article, main, form'));
+    const matchedDivs = [];
+    const allDivs = Array.from(document.querySelectorAll('div, section, article, main, form, [role="listitem"], li'));
     for (const div of allDivs) {
       if (!isVisibleElement(div)) continue;
       const directChildren = Array.from(div.children);
@@ -240,13 +241,17 @@
         const tag = child.tagName.toLowerCase();
         const isClickableTag = tag === 'li' || tag === 'button' || tag === 'label' || tag === 'a';
         const hasBorderOrBg = child.className && /option|choice|answer|btn|card|item|box/i.test(child.className);
-        return isClickableTag || hasBorderOrBg || child.querySelector('input');
+        return isClickableTag || hasBorderOrBg || child.querySelector('input, [role="radio"], [role="option"]');
       });
 
       if (optionLikeChildren.length >= 2 && optionLikeChildren.length <= 8) {
-        return [div];
+        if (!matchedDivs.some((existing) => existing.contains(div) || div.contains(existing))) {
+          matchedDivs.push(div);
+        }
       }
     }
+
+    if (matchedDivs.length > 0) return matchedDivs;
 
     return rawNodes.length > 0 ? rawNodes : [document.body];
   }
