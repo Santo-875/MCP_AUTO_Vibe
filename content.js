@@ -206,151 +206,223 @@
   }
 
   function findQuestionElements() {
-    const rawNodes = [];
+    const questionContainers = [];
+    const seenElements = new Set();
 
-    SCAN_SELECTORS.questionContainers.forEach((selector) => {
+    // Strategy 1: Group Radio/Checkbox inputs by 'name' or nearest group
+    const inputs = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"]')).filter(isVisibleElement);
+    if (inputs.length >= 2) {
+      const groups = new Map();
+      inputs.forEach((input) => {
+        const groupKey = input.name || input.getAttribute('name') || input.closest('[role="radiogroup"], fieldset, form, div')?.id || 'default_group';
+        if (!groups.has(groupKey)) groups.set(groupKey, []);
+        groups.get(groupKey).push(input);
+      });
+
+      for (const [key, groupInputs] of groups.entries()) {
+        if (groupInputs.length >= 2) {
+          let parent = groupInputs[0].parentElement;
+          while (parent && parent !== document.body) {
+            const containsAll = groupInputs.every((inp) => parent.contains(inp));
+            if (containsAll) break;
+            parent = parent.parentElement;
+          }
+          if (parent && parent !== document.body && !seenElements.has(parent)) {
+            const otherInputs = Array.from(parent.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"]'))
+              .filter((inp) => !groupInputs.includes(inp));
+            if (otherInputs.length === 0) {
+              seenElements.add(parent);
+              questionContainers.push(parent);
+            }
+          }
+        }
+      }
+    }
+
+    // Strategy 2: Explicit Question Container Selectors
+    const explicitSelectors = [
+      'fieldset',
+      '[role="radiogroup"]',
+      '.freebirdFormviewerViewNumberedItemContainer',
+      'div[role="listitem"]',
+      '.Qr7Oae',
+      '.que',
+      '.multichoice',
+      '.question-container',
+      '.quiz-question',
+      '.question',
+      '.mcq-item',
+      '.wpProQuiz_listItem',
+      '.test-question',
+      '.exam-question',
+      '[data-question-id]',
+      '[data-testid="question-card"]',
+    ];
+
+    explicitSelectors.forEach((sel) => {
       try {
-        document.querySelectorAll(selector).forEach((node) => {
-          if (!rawNodes.includes(node) && isVisibleElement(node)) {
-            rawNodes.push(node);
+        document.querySelectorAll(sel).forEach((el) => {
+          if (!isVisibleElement(el) || seenElements.has(el)) return;
+          const optionCandidates = el.querySelectorAll('input, [role="radio"], [role="option"], label, .option, .choice, .answer');
+          if (optionCandidates.length >= 2) {
+            const hasSubQuestion = questionContainers.some((q) => el.contains(q));
+            if (!hasSubQuestion) {
+              seenElements.add(el);
+              questionContainers.push(el);
+            }
           }
         });
       } catch (e) {}
     });
 
-    const filtered = rawNodes.filter((node) => {
-      const radios = node.querySelectorAll(
-        'input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], .choice, .option, .test-option'
-      );
-      const hasInputs = radios.length >= 2;
-      const isTooBig = node.querySelectorAll('fieldset, .question, .mcq-item').length > 1;
-      return hasInputs && !isTooBig;
-    });
+    // Strategy 3: General Blocks containing choice lists / buttons
+    if (questionContainers.length === 0) {
+      const candidateBlocks = Array.from(document.querySelectorAll('div, section, article, li, form, main')).filter(isVisibleElement);
+      for (const block of candidateBlocks) {
+        if (seenElements.has(block)) continue;
+        const choices = Array.from(block.querySelectorAll('button, label, li, .choice, .option, .answer, [role="button"], [role="option"]')).filter((c) => {
+          if (!isVisibleElement(c)) return false;
+          const txt = cleanText(c.textContent);
+          return txt.length > 0 && txt.length < 250 && !isNavigationText(txt);
+        });
 
-    if (filtered.length > 0) return filtered;
-
-    const matchedDivs = [];
-    const allDivs = Array.from(document.querySelectorAll('div, section, article, main, form, [role="listitem"], li'));
-    for (const div of allDivs) {
-      if (!isVisibleElement(div)) continue;
-      const directChildren = Array.from(div.children);
-      const optionLikeChildren = directChildren.filter((child) => {
-        const text = cleanText(child.textContent);
-        if (text.length === 0 || text.length > 300) return false;
-        if (isNavigationText(text)) return false;
-        const tag = child.tagName.toLowerCase();
-        const isClickableTag = tag === 'li' || tag === 'button' || tag === 'label' || tag === 'a';
-        const hasBorderOrBg = child.className && /option|choice|answer|btn|card|item|box/i.test(child.className);
-        return isClickableTag || hasBorderOrBg || child.querySelector('input, [role="radio"], [role="option"]');
-      });
-
-      if (optionLikeChildren.length >= 2 && optionLikeChildren.length <= 8) {
-        if (!matchedDivs.some((existing) => existing.contains(div) || div.contains(existing))) {
-          matchedDivs.push(div);
+        if (choices.length >= 2 && choices.length <= 8) {
+          if (!questionContainers.some((existing) => existing.contains(block) || block.contains(existing))) {
+            seenElements.add(block);
+            questionContainers.push(block);
+          }
         }
       }
     }
 
-    if (matchedDivs.length > 0) return matchedDivs;
+    // Strategy 4: Fallback single active question on screen
+    if (questionContainers.length === 0) {
+      const anyChoices = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], label, .option, .choice, .answer, button')).filter((c) => {
+        if (!isVisibleElement(c)) return false;
+        const txt = cleanText(c.textContent);
+        return txt.length > 0 && txt.length < 250 && !isNavigationText(txt);
+      });
+      if (anyChoices.length >= 2) {
+        return [document.querySelector('main') || document.querySelector('form') || document.body];
+      }
+    }
 
-    return rawNodes.length > 0 ? rawNodes : [document.body];
+    return questionContainers;
   }
 
   function parseQuestion(container, index) {
     let questionText = '';
-    const titleCandidates = [
-      container.querySelector('legend'),
-      container.querySelector('[role="heading"]'),
-      container.querySelector('h1, h2, h3, h4, h5, h6'),
-      container.querySelector('.question-title, .title, .prompt, .stem, .question-text, .qtext'),
-      container.querySelector('p:first-of-type'),
-      container.querySelector('div:first-child'),
+
+    // 1. Search common heading / prompt elements inside container
+    const headingSelectors = [
+      'legend',
+      '[role="heading"]',
+      'h1, h2, h3, h4, h5, h6',
+      '.question-title',
+      '.question-text',
+      '.title',
+      '.prompt',
+      '.stem',
+      '.qtext',
+      '.freebirdFormviewerComponentsQuestionBaseHeader',
+      '.M7eMe',
+      'p.question',
+      'p:first-of-type',
+      'div:first-child',
     ];
 
-    for (const candidate of titleCandidates) {
-      if (candidate && cleanText(candidate.textContent).length > 5 && !isNavigationText(candidate.textContent)) {
-        questionText = cleanText(candidate.textContent);
-        break;
+    for (const sel of headingSelectors) {
+      const el = container.querySelector(sel);
+      if (el && isVisibleElement(el)) {
+        const txt = cleanText(el.textContent);
+        if (txt.length > 3 && !isNavigationText(txt)) {
+          questionText = txt;
+          break;
+        }
       }
     }
 
+    // 2. If no prompt found from headings, clone container and remove choices to extract stem text
     if (!questionText) {
       const cloned = container.cloneNode(true);
-      cloned.querySelectorAll('input, [role="radio"], [role="option"], label, button, .choice, .option, .answer').forEach((el) => el.remove());
-      questionText = cleanText(cloned.textContent);
+      cloned.querySelectorAll('input, [role="radio"], [role="option"], label, button, .choice, .option, .answer, ul, ol').forEach((el) => el.remove());
+      const rawStem = cleanText(cloned.textContent);
+      if (rawStem.length > 3 && !isNavigationText(rawStem)) {
+        questionText = rawStem;
+      }
     }
 
     if (!questionText) {
-      questionText = cleanText(container.textContent).substring(0, 140);
+      questionText = cleanText(container.textContent).substring(0, 160);
     }
 
+    // 3. Extract Options
     const options = [];
     const optionElements = [];
-
-    let optionCandidates = Array.from(
-      container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .test-option, [class*="option"], [class*="choice"]')
-    ).filter((el) => isVisibleElement(el));
-
-    if (optionCandidates.length < 2) {
-      optionCandidates = Array.from(container.children).filter((child) => {
-        const txt = cleanText(child.textContent);
-        return txt.length > 0 && txt.length < 250 && !isNavigationText(txt);
-      });
-    }
-
-    let isAnswered = false;
     const seenTexts = new Set();
+    let isAnswered = false;
 
-    optionCandidates.forEach((inputEl) => {
-      let optionText = '';
-      let targetClickElement = inputEl;
+    const candidateElements = Array.from(
+      container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .quiz-option, .test-option, li, button:not([type="submit"])')
+    ).filter(isVisibleElement);
 
-      if (inputEl.tagName === 'INPUT') {
-        if (inputEl.checked) isAnswered = true;
-        if (inputEl.id) {
-          const label = document.querySelector(`label[for="${inputEl.id}"]`);
-          if (label) {
-            optionText = cleanText(label.textContent);
-            targetClickElement = label;
+    candidateElements.forEach((el) => {
+      if (isNavigationText(el.textContent)) return;
+
+      let optText = '';
+      let clickEl = el;
+
+      if (el.tagName === 'INPUT') {
+        if (el.checked) isAnswered = true;
+        if (el.id) {
+          const lbl = document.querySelector(`label[for="${el.id}"]`);
+          if (lbl) {
+            optText = cleanText(lbl.textContent);
+            clickEl = lbl;
           }
         }
-        if (!optionText && inputEl.closest('label')) {
-          optionText = cleanText(inputEl.closest('label').textContent);
-          targetClickElement = inputEl.closest('label');
+        if (!optText && el.closest('label')) {
+          optText = cleanText(el.closest('label').textContent);
+          clickEl = el.closest('label');
         }
       } else {
-        const isChecked =
-          inputEl.getAttribute('aria-checked') === 'true' ||
-          inputEl.getAttribute('aria-selected') === 'true' ||
-          inputEl.classList.contains('selected') ||
-          inputEl.classList.contains('active') ||
-          inputEl.classList.contains('checked');
+        const isSelected =
+          el.getAttribute('aria-checked') === 'true' ||
+          el.getAttribute('aria-selected') === 'true' ||
+          el.classList.contains('selected') ||
+          el.classList.contains('active') ||
+          el.classList.contains('checked') ||
+          !!el.querySelector('input:checked');
 
-        if (isChecked) isAnswered = true;
-        optionText = cleanText(inputEl.textContent);
+        if (isSelected) isAnswered = true;
+        optText = cleanText(el.textContent);
       }
 
-      if (!optionText) {
-        const parent = inputEl.parentElement;
-        if (parent) optionText = cleanText(parent.textContent);
+      if (!optText) {
+        optText = cleanText(el.textContent);
       }
 
-      // Filter out navigation or duplicate texts
+      // Clean option prefixes like "A)", "B.", "1.", "(a)", "•"
+      optText = optText.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
+
       if (
-        optionText &&
-        optionText !== questionText &&
-        optionText.length > 0 &&
-        !isNavigationText(optionText) &&
-        !seenTexts.has(optionText)
+        optText &&
+        optText.length > 0 &&
+        optText.length < 250 &&
+        optText !== questionText &&
+        !isNavigationText(optText) &&
+        !seenTexts.has(optText.toLowerCase())
       ) {
-        seenTexts.add(optionText);
-        options.push(optionText);
-        optionElements.push(targetClickElement);
+        seenTexts.add(optText.toLowerCase());
+        options.push(optText);
+        optionElements.push(clickEl);
       }
     });
 
-    const uniqueId = container.id || hashString(questionText);
-    container.setAttribute('data-gemini-qid', uniqueId);
+    const uniqueId = container.id || hashString(questionText + '_' + options.join('_'));
+    try {
+      container.setAttribute('data-gemini-qid', uniqueId);
+    } catch (e) {}
 
     return {
       id: uniqueId,

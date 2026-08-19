@@ -370,21 +370,20 @@ async function runAutomationLoop(tabId) {
       }
 
       // 5. NAVIGATION / PAGINATION LOGIC:
-      // If Next button exists (step-by-step quiz like GK/GS tests), do NOT scroll! Click Next › directly!
+      // If Next button exists (step-by-step single-question tests), click Next › to advance!
       if (scanResult?.hasNextPage) {
-        log('info', 'Question answered. Clicking "Next ›" to advance to next question...');
+        log('info', 'Question completed. Clicking "Next ›" to advance to next question...');
         sessionState.status = 'SCROLLING';
         broadcastState();
 
         const nextRes = await chrome.tabs.sendMessage(tabId, { type: 'CLICK_NEXT_PAGE' });
         if (nextRes?.clicked) {
-          // Wait for next question page transition
           await new Promise((r) => setTimeout(r, 1200));
           continue;
         }
       }
 
-      // If NO Next button exists, check if scroll is needed
+      // If NO Next button exists and bottom is not reached, scroll down to reveal subsequent questions
       if (!scanResult?.hasNextPage && !scanResult?.bottomReached) {
         sessionState.status = 'SCROLLING';
         broadcastState();
@@ -397,11 +396,14 @@ async function runAutomationLoop(tabId) {
 
         await new Promise((r) => setTimeout(r, sessionState.config.scrollDelayMs || 800));
         if (scrollResponse?.bottomReached) sessionState.stats.bottomReached = true;
-      } else {
-        // Quiz is finished! Handle Auto-Submit
-        log('success', `All ${sessionState.stats.detected || sessionState.stats.answered} questions completed!`);
+        continue;
+      }
 
-        if (sessionState.config.autoSubmit) {
+      // 6. COMPLETION & AUTO-SUBMIT LOGIC:
+      // If bottom reached OR submit button present
+      if (scanResult?.bottomReached || scanResult?.hasSubmit) {
+        // If submit button is present and autoSubmit is enabled
+        if (sessionState.config.autoSubmit && scanResult?.hasSubmit) {
           sessionState.status = 'SUBMITTING';
           sessionState.stats.submissionStatus = 'SUBMITTING';
           broadcastState();
@@ -416,20 +418,25 @@ async function runAutomationLoop(tabId) {
             sessionState.stats.isComplete = true;
             sessionState.status = 'COMPLETED';
             log('success', `Quiz Submission Verified! ${sessionState.stats.submissionMessage}`);
-          } else {
-            sessionState.stats.submissionStatus = 'SUCCESS';
-            sessionState.status = 'COMPLETED';
-            sessionState.stats.isComplete = true;
-            log('info', 'Quiz completed.');
+            broadcastState();
+            return;
           }
-        } else {
-          sessionState.status = 'COMPLETED';
-          sessionState.stats.isComplete = true;
-          log('info', 'All questions answered. Auto-submit is OFF.');
         }
 
-        broadcastState();
-        return;
+        // If at least 1 question was detected or answered
+        if (sessionState.stats.answered > 0 || sessionState.stats.detected > 0) {
+          sessionState.status = 'COMPLETED';
+          sessionState.stats.isComplete = true;
+          sessionState.stats.submissionStatus = 'SUCCESS';
+          log('success', `All ${sessionState.stats.answered} questions completed!`);
+          broadcastState();
+          return;
+        } else {
+          // If at bottom but 0 questions scanned yet, wait briefly and retry
+          log('info', 'Scanning page for quiz questions...');
+          await new Promise((r) => setTimeout(r, 1200));
+          continue;
+        }
       }
     } catch (loopErr) {
       log('error', `Automation step: ${loopErr.message}`);
