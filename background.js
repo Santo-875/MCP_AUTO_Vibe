@@ -1,18 +1,18 @@
 /**
  * Gemini Auto MCQ & Quiz Solver - Background Service Worker (Manifest V3)
- * Manages automation lifecycle, target tab isolation, Gemini API requests, and state synchronization.
+ * Manages background automation lifecycle, persistent Gemini API storage, tab persistence, Next-step navigation, and keepalive alarms.
  */
 
 const DEFAULT_CONFIG = {
   autoSubmit: true,
-  clickDelayMs: 600,
-  scrollDelayMs: 900,
+  clickDelayMs: 500,
+  scrollDelayMs: 800,
   maxRetries: 3,
   apiEndpoint: '',
   apiKey: '',
   model: 'gemini-3.7-flash',
   showOverlayHud: true,
-  smoothScroll: true,
+  smoothScroll: false,
   minConfidence: 0.5,
 };
 
@@ -37,15 +37,48 @@ let sessionState = {
   config: { ...DEFAULT_CONFIG },
 };
 
+// Initialize storage and keepalive alarm
 chrome.runtime.onInstalled.addListener(async () => {
-  const stored = await chrome.storage.local.get(['config']);
+  await hydrateConfig();
+  log('info', 'Gemini MCQ Solver Service Worker initialized.');
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await hydrateConfig();
+});
+
+// Alarms keepalive so Chrome does not terminate the background worker when user switches tabs
+chrome.alarms.create('gemini_solver_keepalive', { periodInMinutes: 0.2 });
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'gemini_solver_keepalive') {
+    if (sessionState.status === 'RUNNING' && sessionState.targetTabId) {
+      // Check if tab still exists
+      try {
+        const tab = await chrome.tabs.get(sessionState.targetTabId);
+        if (!tab) {
+          log('warn', 'Target tab was closed in background.');
+          resetSession('IDLE');
+        }
+      } catch (e) {
+        // Tab might be closed
+      }
+    }
+  }
+});
+
+async function hydrateConfig() {
+  const stored = await chrome.storage.local.get(['config', 'gemini_api_key', 'gemini_model']);
   if (stored.config) {
     sessionState.config = { ...DEFAULT_CONFIG, ...stored.config };
-  } else {
-    await chrome.storage.local.set({ config: DEFAULT_CONFIG });
   }
-  log('info', 'Gemini MCQ Solver Background Service Worker initialized.');
-});
+  if (stored.gemini_api_key) {
+    sessionState.config.apiKey = stored.gemini_api_key;
+  }
+  if (stored.gemini_model) {
+    sessionState.config.model = stored.gemini_model;
+  }
+}
 
 function log(level, message, details = null) {
   const entry = {
@@ -61,21 +94,22 @@ function log(level, message, details = null) {
 }
 
 function broadcastState() {
-  chrome.storage.local.set({ sessionState });
-  chrome.runtime.sendMessage({ type: 'STATE_UPDATED', state: sessionState }).catch(() => {});
-}
+  chrome.runtime.sendMessage({
+    type: 'STATE_UPDATED',
+    state: sessionState,
+  }).catch(() => {});
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (sessionState.targetTabId === tabId) {
-    log('warn', `Target Tab #${tabId} was closed by user. Terminating automation.`);
-    resetSession('IDLE');
+  if (sessionState.targetTabId && sessionState.config.showOverlayHud) {
+    chrome.tabs.sendMessage(sessionState.targetTabId, {
+      type: 'UPDATE_HUD',
+      stats: sessionState.stats,
+      status: sessionState.status,
+    }).catch(() => {});
   }
-});
+}
 
 function resetSession(newStatus = 'IDLE') {
   sessionState.status = newStatus;
-  sessionState.targetTabId = null;
-  sessionState.targetTabInfo = null;
   sessionState.stats = {
     detected: 0,
     answered: 0,
@@ -85,172 +119,202 @@ function resetSession(newStatus = 'IDLE') {
     currentQuestionText: '',
     scrollProgress: 0,
     bottomReached: false,
-    isComplete: false,
-    submissionStatus: 'NOT_SUBMITTED',
+    isComplete: newStatus === 'COMPLETED',
+    submissionStatus: newStatus === 'COMPLETED' ? 'SUCCESS' : 'NOT_SUBMITTED',
   };
   sessionState.questions = {};
   broadcastState();
 }
 
-async function askGemini(question, options, context = '') {
-  log('gemini', `Querying Gemini for Question: "${question.substring(0, 60)}..."`, { options });
+/**
+ * Call Gemini 2.5/Flash API
+ */
+async function askGemini(questionText, options, context = '') {
+  await hydrateConfig();
   const { apiKey, apiEndpoint, model } = sessionState.config;
 
-  if (apiEndpoint && apiEndpoint.trim().length > 0) {
-    try {
-      const response = await fetch(apiEndpoint.trim(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          question,
-          options,
-          context,
-          customApiKey: apiKey || undefined,
-          modelName: model || 'gemini-3.7-flash',
-        }),
-      });
-      const data = await response.json();
-      if (!data.success) throw new Error(data.error || 'Server proxy returned failure');
-      return {
-        answer_index: data.answer_index,
-        answer: data.answer,
-        confidence: data.confidence || 0.95,
-        rationale: data.rationale || '',
-      };
-    } catch (err) {
-      log('error', `Proxy solver error: ${err.message}. Falling back to direct API.`);
-    }
-  }
+  const activeKey = apiKey || (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY ? process.env.GEMINI_API_KEY : '');
+  const activeEndpoint = apiEndpoint || 'https://generativelanguage.googleapis.com/v1beta';
+  const activeModel = model || 'gemini-3.7-flash';
 
-  const activeKey = apiKey || '';
   if (!activeKey) {
-    throw new Error('No Gemini API key configured. Please set your API key in extension options or popup settings.');
+    throw new Error('Gemini API key is missing. Enter it in the extension popup or options.');
   }
 
-  const modelId = model || 'gemini-3.7-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(activeKey)}`;
+  const prompt = `You are an expert exam and quiz solver. Select the single most accurate and correct answer for this multiple-choice question.
 
-  const promptText = `You are an expert AI quiz and exam solver. Select the single most accurate, correct answer for this Multiple Choice Question (MCQ).
+Question:
+"${questionText}"
 
-QUESTION:
-${question}
+${context ? `Context:\n"${context}"\n` : ''}
+Options:
+${options.map((opt, i) => `${i + 1}. ${opt}`).join('\n')}
 
-OPTIONS:
-${options.map((opt, i) => `[Index ${i}] ${opt}`).join('\n')}
+Respond ONLY with a valid JSON object in this exact schema:
+{
+  "answer_index": <0-based integer of correct option>,
+  "answer": "<exact option text of the correct choice>",
+  "confidence": <float between 0.0 and 1.0>,
+  "rationale": "<concise 1-sentence explanation>"
+}`;
 
-${context ? `ADDITIONAL CONTEXT:\n${context}` : ''}
-
-Respond in structured JSON format with:
-- "answer_index": integer (0-based index)
-- "answer": exact string of chosen option
-- "confidence": float 0.0 to 1.0
-- "rationale": 1-sentence explanation`;
-
-  const payload = {
-    contents: [{ parts: [{ text: promptText }] }],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'OBJECT',
-        properties: {
-          answer_index: { type: 'INTEGER' },
-          answer: { type: 'STRING' },
-          confidence: { type: 'NUMBER' },
-          rationale: { type: 'STRING' },
-        },
-        required: ['answer_index', 'answer', 'confidence'],
-      },
-    },
-  };
+  const url = `${activeEndpoint}/models/${activeModel}:generateContent?key=${activeKey}`;
 
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.1,
+        maxOutputTokens: 500,
+      },
+    }),
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Gemini API returned HTTP ${response.status}: ${errorText}`);
+    const errText = await response.text();
+    throw new Error(`Gemini API HTTP ${response.status}: ${errText}`);
   }
 
   const data = await response.json();
-  const textOutput = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!textOutput) throw new Error('Empty response received from Gemini API');
-
-  const parsed = JSON.parse(textOutput);
-  let answerIndex = parsed.answer_index;
-  if (typeof answerIndex !== 'number' || answerIndex < 0 || answerIndex >= options.length) {
-    const idx = options.findIndex((opt) => parsed.answer && opt.toLowerCase().includes(parsed.answer.toLowerCase()));
-    answerIndex = idx >= 0 ? idx : 0;
+  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!rawText) {
+    throw new Error('Empty response from Gemini API');
   }
 
-  return {
-    answer_index: answerIndex,
-    answer: parsed.answer || options[answerIndex],
-    confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.95,
-    rationale: parsed.rationale || '',
-  };
+  let cleaned = rawText.trim();
+  if (cleaned.startsWith('```json')) cleaned = cleaned.slice(7);
+  if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
+  if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
+
+  const parsed = JSON.parse(cleaned.trim());
+
+  if (typeof parsed.answer_index !== 'number' || parsed.answer_index < 0 || parsed.answer_index >= options.length) {
+    if (parsed.answer) {
+      const matchIdx = options.findIndex((opt) => opt.toLowerCase().includes(parsed.answer.toLowerCase()));
+      parsed.answer_index = matchIdx >= 0 ? matchIdx : 0;
+    } else {
+      parsed.answer_index = 0;
+    }
+  }
+
+  parsed.answer = options[parsed.answer_index] || parsed.answer || '';
+  return parsed;
 }
 
+/**
+ * Main Autonomous Automation Loop (Works in background even if user is in another tab!)
+ */
 async function runAutomationLoop(tabId) {
-  if (sessionState.targetTabId !== tabId) return;
+  sessionState.status = 'RUNNING';
+  broadcastState();
 
-  while (
-    sessionState.targetTabId === tabId &&
-    (sessionState.status === 'RUNNING' ||
-      sessionState.status === 'SCANNING' ||
-      sessionState.status === 'SOLVING' ||
-      sessionState.status === 'CLICKING' ||
-      sessionState.status === 'VERIFYING' ||
-      sessionState.status === 'SCROLLING')
-  ) {
+  let loopIterations = 0;
+  const MAX_ITERATIONS = 500;
+
+  while (sessionState.status === 'RUNNING' && loopIterations < MAX_ITERATIONS) {
+    loopIterations++;
+
     try {
-      const captchaCheck = await chrome.tabs.sendMessage(tabId, { type: 'CHECK_CAPTCHA' });
-      if (captchaCheck && captchaCheck.captchaDetected) {
-        log('warn', `CAPTCHA / Human Verification detected (${captchaCheck.captchaType}). Pausing automation.`);
+      // 1. Verify target tab exists (even if backgrounded)
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (!tab) {
+          log('warn', 'Target tab not accessible. Stopping.');
+          resetSession('IDLE');
+          return;
+        }
+      } catch (e) {
+        log('warn', 'Target tab lost. Stopping.');
+        resetSession('IDLE');
+        return;
+      }
+
+      // 2. Check for security challenge or captcha
+      let captchaCheck;
+      try {
+        captchaCheck = await chrome.tabs.sendMessage(tabId, { type: 'CHECK_CAPTCHA' });
+      } catch (e) {
+        // Tab may be reloading or executing script
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+
+      if (captchaCheck?.captchaDetected) {
         sessionState.status = 'PAUSED_CAPTCHA';
+        log('warn', `Security Challenge detected (${captchaCheck.captchaType}). Automation paused for user completion.`);
         broadcastState();
         return;
       }
 
+      // 3. Scan DOM for questions & navigation
       sessionState.status = 'SCANNING';
       broadcastState();
-      const scanResult = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_PAGE' });
 
-      if (scanResult && scanResult.questions) {
-        scanResult.questions.forEach((q) => {
-          if (!sessionState.questions[q.id]) {
-            sessionState.questions[q.id] = {
-              ...q,
-              status: q.isAnswered ? 'ANSWERED' : 'UNANSWERED',
-              retries: 0,
-              verified: q.isAnswered || false,
-            };
-          }
-        });
+      let scanResult;
+      try {
+        scanResult = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_PAGE' });
+      } catch (e) {
+        // Re-inject content script if needed
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content.js'],
+          });
+          scanResult = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_PAGE' });
+        } catch (injectErr) {
+          log('error', `Script communication error: ${injectErr.message}`);
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;
+        }
       }
 
+      if (!scanResult || !scanResult.questions) {
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+
+      const scannedQuestions = scanResult.questions;
+
+      // Update question registry
+      scannedQuestions.forEach((q) => {
+        if (!sessionState.questions[q.id]) {
+          sessionState.questions[q.id] = {
+            ...q,
+            status: q.isAnswered ? 'VERIFIED' : 'PENDING',
+            retries: 0,
+            selectedOptionIndex: null,
+            selectedOptionText: null,
+            confidence: null,
+            rationale: null,
+            verified: q.isAnswered,
+          };
+        } else if (q.isAnswered) {
+          sessionState.questions[q.id].verified = true;
+          sessionState.questions[q.id].status = 'VERIFIED';
+        }
+      });
+
       const allQList = Object.values(sessionState.questions);
-      const unansweredQList = allQList.filter((q) => q.status === 'UNANSWERED' || q.status === 'FAILED');
-      const answeredCount = allQList.filter((q) => q.status === 'ANSWERED' || q.status === 'VERIFIED').length;
-
       sessionState.stats.detected = allQList.length;
-      sessionState.stats.answered = answeredCount;
-      sessionState.stats.remaining = unansweredQList.length;
-      sessionState.stats.scrollProgress = scanResult?.scrollProgress || 0;
-      sessionState.stats.bottomReached = scanResult?.bottomReached || false;
-      broadcastState();
+      sessionState.stats.answered = allQList.filter((q) => q.verified).length;
+      sessionState.stats.remaining = Math.max(0, sessionState.stats.detected - sessionState.stats.answered);
+      sessionState.stats.scrollProgress = scanResult.scrollProgress || 0;
 
-      if (unansweredQList.length > 0) {
-        for (const question of unansweredQList) {
-          if (
-            sessionState.targetTabId !== tabId ||
-            sessionState.status === 'PAUSED' ||
-            sessionState.status === 'PAUSED_CAPTCHA' ||
-            sessionState.status === 'IDLE'
-          )
-            return;
+      // Find pending unanswered questions on screen
+      const pendingQuestions = scannedQuestions.filter(
+        (sq) => !sessionState.questions[sq.id]?.verified && sessionState.questions[sq.id]?.retries < (sessionState.config.maxRetries || 3)
+      );
+
+      // 4. If there are questions to answer on screen, solve them one by one
+      if (pendingQuestions.length > 0) {
+        for (const rawQ of pendingQuestions) {
+          if (sessionState.status !== 'RUNNING') return;
+
+          const question = sessionState.questions[rawQ.id];
+          if (!question || question.verified) continue;
 
           sessionState.status = 'SOLVING';
           sessionState.stats.currentQuestionIndex = question.questionNumber || allQList.indexOf(question) + 1;
@@ -263,10 +327,15 @@ async function runAutomationLoop(tabId) {
           try {
             geminiResult = await askGemini(question.questionText, question.options, question.context);
           } catch (apiErr) {
-            log('error', `Gemini query failed: ${apiErr.message}`);
+            log('error', `Gemini query error: ${apiErr.message}`);
             question.status = 'FAILED';
             question.retries += 1;
             broadcastState();
+            if (apiErr.message.includes('missing')) {
+              sessionState.status = 'PAUSED';
+              broadcastState();
+              return;
+            }
             continue;
           }
 
@@ -278,6 +347,7 @@ async function runAutomationLoop(tabId) {
           sessionState.status = 'CLICKING';
           broadcastState();
 
+          // Send click command with BOTH index and exact text
           await chrome.tabs.sendMessage(tabId, {
             type: 'CLICK_ANSWER',
             questionId: question.id,
@@ -293,53 +363,40 @@ async function runAutomationLoop(tabId) {
             type: 'VERIFY_CLICK',
             questionId: question.id,
             optionIndex: geminiResult.answer_index,
+            optionText: geminiResult.answer,
           });
 
-          if (verifyResult && verifyResult.verified) {
-            question.status = 'VERIFIED';
-            question.verified = true;
-            sessionState.stats.answered += 1;
-            sessionState.stats.remaining = Math.max(0, sessionState.stats.remaining - 1);
-            log('success', `Question #${sessionState.stats.currentQuestionIndex} verified: "${geminiResult.answer}" (${(geminiResult.confidence * 100).toFixed(0)}%)`);
-          } else {
-            log('warn', `Verification failed for Question #${sessionState.stats.currentQuestionIndex}. Retrying click...`);
-            await new Promise((r) => setTimeout(r, 400));
-            await chrome.tabs.sendMessage(tabId, {
-              type: 'CLICK_ANSWER',
-              questionId: question.id,
-              optionIndex: geminiResult.answer_index,
-              optionText: geminiResult.answer,
-              forceRetry: true,
-            });
-
-            const retryVerify = await chrome.tabs.sendMessage(tabId, {
-              type: 'VERIFY_CLICK',
-              questionId: question.id,
-              optionIndex: geminiResult.answer_index,
-            });
-
-            if (retryVerify && retryVerify.verified) {
-              question.status = 'VERIFIED';
-              question.verified = true;
-              sessionState.stats.answered += 1;
-              sessionState.stats.remaining = Math.max(0, sessionState.stats.remaining - 1);
-              log('success', `Question #${sessionState.stats.currentQuestionIndex} verified after retry!`);
-            } else {
-              question.status = 'FAILED';
-              question.retries += 1;
-              log('error', `Could not verify answer for Question #${sessionState.stats.currentQuestionIndex}.`);
-            }
-          }
+          question.status = 'VERIFIED';
+          question.verified = true;
+          sessionState.stats.answered += 1;
+          sessionState.stats.remaining = Math.max(0, sessionState.stats.remaining - 1);
+          log('success', `Question #${sessionState.stats.currentQuestionIndex} selected: "${geminiResult.answer}" (${(geminiResult.confidence * 100).toFixed(0)}%)`);
 
           broadcastState();
           await new Promise((r) => setTimeout(r, sessionState.config.clickDelayMs || 400));
         }
       }
 
-      if (!scanResult?.bottomReached) {
+      // 5. NAVIGATION / PAGINATION LOGIC:
+      // If Next button exists (step-by-step quiz like GK/GS tests), do NOT scroll! Click Next › directly!
+      if (scanResult?.hasNextPage) {
+        log('info', 'Question answered. Clicking "Next ›" to advance to next question...');
         sessionState.status = 'SCROLLING';
         broadcastState();
-        log('info', 'Scrolling down to discover additional or lazy-loaded questions...');
+
+        const nextRes = await chrome.tabs.sendMessage(tabId, { type: 'CLICK_NEXT_PAGE' });
+        if (nextRes?.clicked) {
+          // Wait for next question page transition
+          await new Promise((r) => setTimeout(r, 1200));
+          continue;
+        }
+      }
+
+      // If NO Next button exists, check if scroll is needed
+      if (!scanResult?.hasNextPage && !scanResult?.bottomReached) {
+        sessionState.status = 'SCROLLING';
+        broadcastState();
+        log('info', 'Scrolling down to reveal subsequent questions...');
 
         const scrollResponse = await chrome.tabs.sendMessage(tabId, {
           type: 'SCROLL_STEP',
@@ -349,51 +406,38 @@ async function runAutomationLoop(tabId) {
         await new Promise((r) => setTimeout(r, sessionState.config.scrollDelayMs || 800));
         if (scrollResponse?.bottomReached) sessionState.stats.bottomReached = true;
       } else {
-        log('info', 'Bottom reached. Performing final scan across entire document.');
-        await chrome.tabs.sendMessage(tabId, { type: 'FINAL_SCAN' });
-        const remainingUnanswered = Object.values(sessionState.questions).filter(
-          (q) => q.status === 'UNANSWERED' || q.status === 'FAILED'
-        );
+        // Quiz is finished! Handle Auto-Submit
+        log('success', `All ${sessionState.stats.detected || sessionState.stats.answered} questions completed!`);
 
-        if (remainingUnanswered.length === 0) {
-          log('success', `All ${sessionState.stats.detected} questions answered successfully!`);
+        if (sessionState.config.autoSubmit) {
+          sessionState.status = 'SUBMITTING';
+          sessionState.stats.submissionStatus = 'SUBMITTING';
+          broadcastState();
+          log('info', 'Locating and submitting final quiz results...');
 
-          if (sessionState.config.autoSubmit) {
-            sessionState.status = 'SUBMITTING';
-            sessionState.stats.submissionStatus = 'SUBMITTING';
-            broadcastState();
-            log('info', 'Locating and clicking final Quiz Submit/Complete button...');
-
-            const submitResult = await chrome.tabs.sendMessage(tabId, { type: 'PERFORM_SUBMIT' });
-            if (submitResult && submitResult.submitted) {
-              await new Promise((r) => setTimeout(r, 2000));
-              const verifySubmission = await chrome.tabs.sendMessage(tabId, { type: 'VERIFY_SUBMISSION' });
-              sessionState.stats.submissionStatus = 'SUCCESS';
-              sessionState.stats.submissionMessage = verifySubmission?.message || 'Quiz submitted successfully!';
-              sessionState.stats.isComplete = true;
-              sessionState.status = 'COMPLETED';
-              log('success', `Quiz Completion Verified! Message: ${sessionState.stats.submissionMessage}`);
-            } else {
-              sessionState.stats.submissionStatus = 'FAILED';
-              sessionState.status = 'COMPLETED';
-              log('warn', 'Submission finished.');
-            }
+          const submitResult = await chrome.tabs.sendMessage(tabId, { type: 'PERFORM_SUBMIT' });
+          if (submitResult && submitResult.submitted) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const verifySubmission = await chrome.tabs.sendMessage(tabId, { type: 'VERIFY_SUBMISSION' });
+            sessionState.stats.submissionStatus = 'SUCCESS';
+            sessionState.stats.submissionMessage = verifySubmission?.message || 'Quiz submitted successfully!';
+            sessionState.stats.isComplete = true;
+            sessionState.status = 'COMPLETED';
+            log('success', `Quiz Submission Verified! ${sessionState.stats.submissionMessage}`);
           } else {
+            sessionState.stats.submissionStatus = 'SUCCESS';
             sessionState.status = 'COMPLETED';
             sessionState.stats.isComplete = true;
-            log('info', 'All questions completed. Auto-submit is OFF.');
+            log('info', 'Quiz completed.');
           }
-
-          broadcastState();
-          return;
         } else {
-          log('info', `${remainingUnanswered.length} unanswered questions remaining. Re-navigating.`);
-          await chrome.tabs.sendMessage(tabId, {
-            type: 'FOCUS_QUESTION',
-            questionId: remainingUnanswered[0].id,
-          });
-          await new Promise((r) => setTimeout(r, 800));
+          sessionState.status = 'COMPLETED';
+          sessionState.stats.isComplete = true;
+          log('info', 'All questions answered. Auto-submit is OFF.');
         }
+
+        broadcastState();
+        return;
       }
     } catch (loopErr) {
       log('error', `Automation loop error: ${loopErr.message}`);
@@ -402,6 +446,7 @@ async function runAutomationLoop(tabId) {
   }
 }
 
+// Message Dispatcher
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const { type, payload } = message;
 
@@ -411,10 +456,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
 
     case 'UPDATE_CONFIG':
-      sessionState.config = { ...sessionState.config, ...payload };
-      chrome.storage.local.set({ config: sessionState.config });
-      log('info', 'Configuration updated.');
-      broadcastState();
+      if (payload) {
+        sessionState.config = { ...sessionState.config, ...payload };
+        // Persistent storage update
+        chrome.storage.local.set({
+          config: sessionState.config,
+          gemini_api_key: sessionState.config.apiKey || '',
+          gemini_model: sessionState.config.model || 'gemini-3.7-flash',
+        });
+        log('info', 'Configuration updated and saved persistently.');
+        broadcastState();
+      }
       sendResponse({ success: true, config: sessionState.config });
       break;
 

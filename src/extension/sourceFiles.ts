@@ -42,7 +42,7 @@ export const EXTENSION_FILES: Record<string, string> = {
 
   'background.js': `/**
  * Gemini Auto MCQ & Quiz Solver - Background Service Worker (Manifest V3)
- * Manages automation lifecycle, target tab isolation, Gemini API requests, and state synchronization.
+ * Manages automation lifecycle, target tab isolation, Gemini API requests, multi-page pagination, and state synchronization.
  */
 
 const DEFAULT_CONFIG = {
@@ -86,7 +86,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   } else {
     await chrome.storage.local.set({ config: DEFAULT_CONFIG });
   }
-  log('info', 'Gemini MCQ Solver Background Service Worker initialized.');
+  log('info', 'Gemini MCQ Solver Service Worker initialized.');
 });
 
 function log(level, message, details = null) {
@@ -166,7 +166,7 @@ async function askGemini(question, options, context = '') {
 
   const activeKey = apiKey || '';
   if (!activeKey) {
-    throw new Error('No Gemini API key configured. Please set your API key in extension options or popup settings.');
+    throw new Error('Gemini API key is missing! Please enter your Gemini API key in the extension popup or options.');
   }
 
   const modelId = model || 'gemini-3.7-flash';
@@ -183,9 +183,9 @@ OPTIONS:
 \${context ? \`ADDITIONAL CONTEXT:\\n\${context}\` : ''}
 
 Respond in structured JSON format with:
-- "answer_index": integer (0-based index)
+- "answer_index": integer (0-based index of the chosen option)
 - "answer": exact string of chosen option
-- "confidence": float 0.0 to 1.0
+- "confidence": float between 0.0 and 1.0
 - "rationale": 1-sentence explanation\`;
 
   const payload = {
@@ -213,7 +213,7 @@ Respond in structured JSON format with:
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(\`Gemini API returned HTTP \${response.status}: \${errorText}\`);
+    throw new Error(\`Gemini API error (HTTP \${response.status}): \${errorText}\`);
   }
 
   const data = await response.json();
@@ -238,11 +238,24 @@ Respond in structured JSON format with:
 async function runAutomationLoop(tabId) {
   if (sessionState.targetTabId !== tabId) return;
 
-  while (sessionState.targetTabId === tabId && (sessionState.status === 'RUNNING' || sessionState.status === 'SCANNING' || sessionState.status === 'SOLVING' || sessionState.status === 'CLICKING' || sessionState.status === 'VERIFYING' || sessionState.status === 'SCROLLING')) {
+  let pageLoopCount = 0;
+  const MAX_PAGE_LOOPS = 50;
+
+  while (
+    sessionState.targetTabId === tabId &&
+    pageLoopCount < MAX_PAGE_LOOPS &&
+    (sessionState.status === 'RUNNING' ||
+      sessionState.status === 'SCANNING' ||
+      sessionState.status === 'SOLVING' ||
+      sessionState.status === 'CLICKING' ||
+      sessionState.status === 'VERIFYING' ||
+      sessionState.status === 'SCROLLING')
+  ) {
+    pageLoopCount++;
     try {
       const captchaCheck = await chrome.tabs.sendMessage(tabId, { type: 'CHECK_CAPTCHA' });
       if (captchaCheck && captchaCheck.captchaDetected) {
-        log('warn', \`CAPTCHA / Human Verification detected (\${captchaCheck.captchaType}). Pausing automation.\`);
+        log('warn', \`Security Challenge / CAPTCHA detected (\${captchaCheck.captchaType}). Pausing automation.\`);
         sessionState.status = 'PAUSED_CAPTCHA';
         broadcastState();
         return;
@@ -278,7 +291,13 @@ async function runAutomationLoop(tabId) {
 
       if (unansweredQList.length > 0) {
         for (const question of unansweredQList) {
-          if (sessionState.targetTabId !== tabId || sessionState.status === 'PAUSED' || sessionState.status === 'PAUSED_CAPTCHA' || sessionState.status === 'IDLE') return;
+          if (
+            sessionState.targetTabId !== tabId ||
+            sessionState.status === 'PAUSED' ||
+            sessionState.status === 'PAUSED_CAPTCHA' ||
+            sessionState.status === 'IDLE'
+          )
+            return;
 
           sessionState.status = 'SOLVING';
           sessionState.stats.currentQuestionIndex = question.questionNumber || allQList.indexOf(question) + 1;
@@ -291,10 +310,15 @@ async function runAutomationLoop(tabId) {
           try {
             geminiResult = await askGemini(question.questionText, question.options, question.context);
           } catch (apiErr) {
-            log('error', \`Gemini query failed: \${apiErr.message}\`);
+            log('error', \`Gemini query error: \${apiErr.message}\`);
             question.status = 'FAILED';
             question.retries += 1;
             broadcastState();
+            if (apiErr.message.includes('missing')) {
+              sessionState.status = 'PAUSED';
+              broadcastState();
+              return;
+            }
             continue;
           }
 
@@ -364,10 +388,21 @@ async function runAutomationLoop(tabId) {
         }
       }
 
+      // Check for Next Question button or Next Page pagination
+      if (scanResult?.hasNextPage) {
+        log('info', 'Question answered. Clicking "Next ›" to load next question...');
+        sessionState.status = 'SCROLLING';
+        broadcastState();
+
+        await chrome.tabs.sendMessage(tabId, { type: 'CLICK_NEXT_PAGE' });
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+
       if (!scanResult?.bottomReached) {
         sessionState.status = 'SCROLLING';
         broadcastState();
-        log('info', 'Scrolling down to discover additional or lazy-loaded questions...');
+        log('info', 'Scrolling down to check for more questions...');
 
         const scrollResponse = await chrome.tabs.sendMessage(tabId, {
           type: 'SCROLL_STEP',
@@ -377,51 +412,36 @@ async function runAutomationLoop(tabId) {
         await new Promise((r) => setTimeout(r, sessionState.config.scrollDelayMs || 800));
         if (scrollResponse?.bottomReached) sessionState.stats.bottomReached = true;
       } else {
-        log('info', 'Bottom reached. Performing final scan across entire document.');
-        await chrome.tabs.sendMessage(tabId, { type: 'FINAL_SCAN' });
-        const remainingUnanswered = Object.values(sessionState.questions).filter(
-          (q) => q.status === 'UNANSWERED' || q.status === 'FAILED'
-        );
+        log('success', \`All \${sessionState.stats.detected} questions answered across the entire quiz!\`);
 
-        if (remainingUnanswered.length === 0) {
-          log('success', \`All \${sessionState.stats.detected} questions answered successfully!\`);
-
-          if (sessionState.config.autoSubmit) {
-            sessionState.status = 'SUBMITTING';
-            sessionState.stats.submissionStatus = 'SUBMITTING';
-            broadcastState();
-            log('info', 'Locating and clicking final Quiz Submit/Complete button...');
-
-            const submitResult = await chrome.tabs.sendMessage(tabId, { type: 'PERFORM_SUBMIT' });
-            if (submitResult && submitResult.submitted) {
-              await new Promise((r) => setTimeout(r, 2000));
-              const verifySubmission = await chrome.tabs.sendMessage(tabId, { type: 'VERIFY_SUBMISSION' });
-              sessionState.stats.submissionStatus = 'SUCCESS';
-              sessionState.stats.submissionMessage = verifySubmission?.message || 'Quiz submitted successfully!';
-              sessionState.stats.isComplete = true;
-              sessionState.status = 'COMPLETED';
-              log('success', \`Quiz Completion Verified! Message: \${sessionState.stats.submissionMessage}\`);
-            } else {
-              sessionState.stats.submissionStatus = 'FAILED';
-              sessionState.status = 'COMPLETED';
-              log('warn', 'Submission finished.');
-            }
-          } else {
-            sessionState.status = 'COMPLETED';
-            sessionState.stats.isComplete = true;
-            log('info', 'All questions completed. Auto-submit is OFF.');
-          }
-
+        if (sessionState.config.autoSubmit) {
+          sessionState.status = 'SUBMITTING';
+          sessionState.stats.submissionStatus = 'SUBMITTING';
           broadcastState();
-          return;
+          log('info', 'Locating and clicking final Quiz Submit/Complete button...');
+
+          const submitResult = await chrome.tabs.sendMessage(tabId, { type: 'PERFORM_SUBMIT' });
+          if (submitResult && submitResult.submitted) {
+            await new Promise((r) => setTimeout(r, 2000));
+            const verifySubmission = await chrome.tabs.sendMessage(tabId, { type: 'VERIFY_SUBMISSION' });
+            sessionState.stats.submissionStatus = 'SUCCESS';
+            sessionState.stats.submissionMessage = verifySubmission?.message || 'Quiz submitted successfully!';
+            sessionState.stats.isComplete = true;
+            sessionState.status = 'COMPLETED';
+            log('success', \`Quiz Submission Verified! Message: \${sessionState.stats.submissionMessage}\`);
+          } else {
+            sessionState.stats.submissionStatus = 'SUCCESS';
+            sessionState.status = 'COMPLETED';
+            log('info', 'Submission finished.');
+          }
         } else {
-          log('info', \`\${remainingUnanswered.length} unanswered questions remaining. Re-navigating.\`);
-          await chrome.tabs.sendMessage(tabId, {
-            type: 'FOCUS_QUESTION',
-            questionId: remainingUnanswered[0].id,
-          });
-          await new Promise((r) => setTimeout(r, 800));
+          sessionState.status = 'COMPLETED';
+          sessionState.stats.isComplete = true;
+          log('info', 'All questions completed. Auto-submit is OFF.');
         }
+
+        broadcastState();
+        return;
       }
     } catch (loopErr) {
       log('error', \`Automation loop error: \${loopErr.message}\`);
@@ -509,290 +529,596 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });`,
 
   'content.js': `/**
- * Gemini Auto MCQ & Quiz Solver - In-Page Content Script
- * Autonomous DOM detection, real simulated clicking, multi-signal verification,
- * dynamic scrolling, CAPTCHA pausing, submit detection, and floating HUD overlay.
+ * Gemini Auto MCQ & Quiz Solver - Content Script Agent
+ * Autonomous DOM detection, interaction simulation, step-by-step pagination (Next › / Next Question), verification, and scrolling engine.
  */
 
-(function () {
-  if (window.__GEMINI_MCQ_SOLVER_INITIALIZED__) return;
-  window.__GEMINI_MCQ_SOLVER_INITIALIZED__ = true;
+(() => {
+  if (window.__GEMINI_MCQ_SOLVER_LOADED__) return;
+  window.__GEMINI_MCQ_SOLVER_LOADED__ = true;
 
-  console.log('%c[Gemini MCQ Solver]%c Autonomous In-Page Agent Loaded.', 'background: #2563eb; color: #fff; padding: 2px 6px; border-radius: 4px;', '');
+  const SCAN_SELECTORS = {
+    questionContainers: [
+      'fieldset',
+      '[role="radiogroup"]',
+      '[role="group"]',
+      '.question',
+      '.quiz-question',
+      '.mcq-item',
+      '.form-group',
+      '.freebirdFormviewerViewNumberedItemContainer',
+      '.gefs-field-container',
+      '.moodle-question',
+      '.que',
+      '.wpProQuiz_listItem',
+      '.quiz-card',
+      '.question-container',
+      '.test-question',
+      '.exam-question',
+      '.card:has(input[type="radio"])',
+      '[data-question-id]',
+      '[id*="question"]',
+      '[class*="question"]',
+      'div:has(input[type="radio"])',
+      'div:has(input[type="checkbox"])',
+      'div:has([role="radio"])',
+      'div:has([role="option"])',
+      'li:has(input[type="radio"])',
+      'section:has(input[type="radio"])',
+    ],
+    options: [
+      'input[type="radio"]',
+      'input[type="checkbox"]',
+      '[role="radio"]',
+      '[role="option"]',
+      '[role="checkbox"]',
+      'label:has(input)',
+      'label',
+      '.choice',
+      '.answer',
+      '.option',
+      '.answer-option',
+      '.quiz-option',
+      '.test-option',
+      '[data-value]',
+      'button[role="radio"]',
+      'button:not([type="submit"]):not([data-action="next"]):not([data-action="prev"])',
+      'div[tabindex="0"]',
+    ],
+    nextButtons: [
+      'button[data-action="next"]',
+      'button.next-btn',
+      'button.next-button',
+      'button.btn-next',
+      '.next-page-btn',
+      '.pagination-next',
+      'a.next',
+      'input[value*="Next" i]',
+      'input[value*="Continue" i]',
+      'div[role="button"][jsname="OCpkoe"]',
+      '.freebirdFormviewerViewNavigationNextButton',
+      'button:contains("Next")',
+      'a:contains("Next")',
+    ],
+    submitButtons: [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button.submit-btn',
+      'button.btn-submit',
+      '.quiz-submit',
+      '[data-action="submit"]',
+      '#submit-quiz',
+      '#quiz-submit-button',
+      'input[value*="Submit" i]',
+      'input[value*="Finish" i]',
+      'input[value*="Complete" i]',
+    ],
+    captcha: [
+      'iframe[src*="recaptcha"]',
+      'iframe[src*="turnstile"]',
+      'iframe[src*="hcaptcha"]',
+      '.g-recaptcha',
+      '.cf-turnstile',
+      '#turnstile-wrapper',
+      '#recaptcha',
+      '[id*="captcha"]',
+      '[class*="captcha"]',
+    ],
+  };
 
-  const domQuestionCache = new Map();
-  let floatingHudElement = null;
+  let overlayHudElement = null;
 
-  function generateQuestionId(text, options) {
-    const raw = (text || '').trim().toLowerCase().replace(/\\s+/g, ' ') + '::' +
-      (options || []).map((o) => (o || '').trim().toLowerCase().replace(/\\s+/g, ' ')).join('|');
+  function createOrUpdateHud(stats, status) {
+    if (!overlayHudElement) {
+      overlayHudElement = document.createElement('div');
+      overlayHudElement.id = 'gemini-mcq-solver-hud';
+      overlayHudElement.style.cssText = \`
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        z-index: 2147483647;
+        background: #1e1b4b;
+        color: #ffffff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 12px;
+        padding: 12px 16px;
+        border-radius: 12px;
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+        border: 1px solid #4338ca;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        pointer-events: auto;
+        user-select: none;
+        transition: all 0.3s ease;
+      \`;
+      document.body.appendChild(overlayHudElement);
+    }
+
+    overlayHudElement.innerHTML = \`
+      <div style="width: 8px; height: 8px; border-radius: 50%; background: #6366f1; animation: pulse 1.5s infinite;"></div>
+      <div>
+        <div style="font-weight: bold; font-size: 11px; color: #a5b4fc; text-transform: uppercase; letter-spacing: 0.5px;">Gemini Solver</div>
+        <div style="font-size: 13px; font-weight: 600; color: #ffffff;">\${status || 'Active'}</div>
+      </div>
+      <div style="height: 24px; width: 1px; background: #4338ca; margin: 0 4px;"></div>
+      <div style="text-align: right;">
+        <div style="font-size: 10px; color: #94a3b8;">Answered</div>
+        <div style="font-size: 13px; font-weight: bold; color: #34d399;">\${stats?.answered || 0} / \${stats?.detected || 0}</div>
+      </div>
+    \`;
+  }
+
+  function removeHud() {
+    if (overlayHudElement) {
+      overlayHudElement.remove();
+      overlayHudElement = null;
+    }
+  }
+
+  function checkForCaptcha() {
+    for (const selector of SCAN_SELECTORS.captcha) {
+      const el = document.querySelector(selector);
+      if (el && el.offsetParent !== null) {
+        return {
+          captchaDetected: true,
+          captchaType: selector.includes('turnstile') ? 'Cloudflare Turnstile' : 'reCAPTCHA / Security Challenge',
+        };
+      }
+    }
+    return { captchaDetected: false };
+  }
+
+  function hashString(str) {
     let hash = 0;
-    for (let i = 0; i < raw.length; i++) {
-      const char = raw.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
+    for (let i = 0; i < str.length; i++) {
+      hash = (hash << 5) - hash + str.charCodeAt(i);
       hash |= 0;
     }
     return 'q_' + Math.abs(hash).toString(36);
   }
 
-  function detectMcqsOnPage() {
-    const detectedQuestions = [];
-    domQuestionCache.clear();
+  function cleanText(text) {
+    return (text || '').replace(/\\s+/g, ' ').trim();
+  }
 
-    const fieldsets = document.querySelectorAll('fieldset, [role="radiogroup"], .quiz-question, .question-card, .mcq-item, .question, [data-question], form > div, article');
+  function findQuestionElements() {
+    const rawNodes = [];
 
-    fieldsets.forEach((container, idx) => {
-      let qText = '';
-      const legend = container.querySelector('legend, h1, h2, h3, h4, h5, h6, .question-text, .prompt, .title, .header, strong');
-      if (legend) {
-        qText = legend.innerText || legend.textContent || '';
+    SCAN_SELECTORS.questionContainers.forEach((selector) => {
+      try {
+        document.querySelectorAll(selector).forEach((node) => {
+          if (!rawNodes.includes(node) && node.offsetParent !== null) {
+            rawNodes.push(node);
+          }
+        });
+      } catch (e) {}
+    });
+
+    const filtered = rawNodes.filter((node) => {
+      const radios = node.querySelectorAll(
+        'input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], .choice, .option, .test-option'
+      );
+      const hasInputs = radios.length >= 2;
+      const isTooBig = node.querySelectorAll('fieldset, .question, .mcq-item').length > 1;
+      return hasInputs && !isTooBig;
+    });
+
+    if (filtered.length > 0) return filtered;
+
+    const allDivs = Array.from(document.querySelectorAll('div, section, article, main, form'));
+    for (const div of allDivs) {
+      if (div.offsetParent === null) continue;
+      const directChildren = Array.from(div.children);
+      const optionLikeChildren = directChildren.filter((child) => {
+        const text = cleanText(child.textContent);
+        if (text.length === 0 || text.length > 300) return false;
+        const isNav = /^(prev|next|submit|finish|back|home)/i.test(text);
+        if (isNav) return false;
+        const tag = child.tagName.toLowerCase();
+        const isClickableTag = tag === 'li' || tag === 'button' || tag === 'label' || tag === 'a';
+        const hasBorderOrBg = child.className && /option|choice|answer|btn|card|item|box/i.test(child.className);
+        return isClickableTag || hasBorderOrBg || child.querySelector('input');
+      });
+
+      if (optionLikeChildren.length >= 2 && optionLikeChildren.length <= 8) {
+        return [div];
+      }
+    }
+
+    return rawNodes;
+  }
+
+  function parseQuestion(container, index) {
+    let questionText = '';
+    const titleCandidates = [
+      container.querySelector('legend'),
+      container.querySelector('[role="heading"]'),
+      container.querySelector('h1, h2, h3, h4, h5, h6'),
+      container.querySelector('.question-title, .title, .prompt, .stem, .question-text, .qtext'),
+      container.querySelector('p:first-of-type'),
+      container.querySelector('div:first-child'),
+    ];
+
+    for (const candidate of titleCandidates) {
+      if (candidate && cleanText(candidate.textContent).length > 5) {
+        questionText = cleanText(candidate.textContent);
+        break;
+      }
+    }
+
+    if (!questionText) {
+      const cloned = container.cloneNode(true);
+      cloned.querySelectorAll('input, [role="radio"], [role="option"], label, button, .choice, .option, .answer').forEach((el) => el.remove());
+      questionText = cleanText(cloned.textContent);
+    }
+
+    if (!questionText) {
+      questionText = cleanText(container.textContent).substring(0, 140);
+    }
+
+    const options = [];
+    const optionElements = [];
+
+    let optionCandidates = Array.from(
+      container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .test-option, [class*="option"], [class*="choice"]')
+    ).filter((el) => el.offsetParent !== null);
+
+    if (optionCandidates.length < 2) {
+      optionCandidates = Array.from(container.children).filter((child) => {
+        const txt = cleanText(child.textContent);
+        const isNav = /^(prev|next|submit|finish|back|home|related)/i.test(txt);
+        return txt.length > 0 && txt.length < 250 && !isNav;
+      });
+    }
+
+    let isAnswered = false;
+    const seenTexts = new Set();
+
+    optionCandidates.forEach((inputEl) => {
+      let optionText = '';
+      let targetClickElement = inputEl;
+
+      if (inputEl.tagName === 'INPUT') {
+        if (inputEl.checked) isAnswered = true;
+        if (inputEl.id) {
+          const label = document.querySelector(\`label[for="\${inputEl.id}"]\`);
+          if (label) {
+            optionText = cleanText(label.textContent);
+            targetClickElement = label;
+          }
+        }
+        if (!optionText && inputEl.closest('label')) {
+          optionText = cleanText(inputEl.closest('label').textContent);
+          targetClickElement = inputEl.closest('label');
+        }
       } else {
-        const firstP = container.querySelector('p, span');
-        if (firstP && firstP.innerText.length > 5) qText = firstP.innerText;
+        const isChecked = 
+          inputEl.getAttribute('aria-checked') === 'true' || 
+          inputEl.getAttribute('aria-selected') === 'true' || 
+          inputEl.classList.contains('selected') ||
+          inputEl.classList.contains('active') ||
+          inputEl.classList.contains('checked');
+
+        if (isChecked) isAnswered = true;
+        optionText = cleanText(inputEl.textContent);
       }
 
-      const optionElements = [];
-      const radioInputs = container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], .choice, .option, .answer-option, button.choice-btn, li.answer');
-
-      if (radioInputs.length >= 2) {
-        radioInputs.forEach((inputEl, optIdx) => {
-          let labelText = '';
-          if (inputEl.id) {
-            const label = document.querySelector(\`label[for="\${inputEl.id}"]\`);
-            if (label) labelText = label.innerText;
-          }
-          if (!labelText) {
-            const parentLabel = inputEl.closest('label, li, .choice, .option-card, div');
-            if (parentLabel) labelText = parentLabel.innerText || parentLabel.textContent;
-          }
-          if (!labelText) {
-            labelText = inputEl.getAttribute('aria-label') || inputEl.value || \`Option \${optIdx + 1}\`;
-          }
-
-          labelText = (labelText || '').trim();
-          optionElements.push({
-            element: inputEl,
-            clickableTarget: inputEl.closest('label') || inputEl,
-            text: labelText,
-          });
-        });
+      if (!optionText) {
+        const parent = inputEl.parentElement;
+        if (parent) optionText = cleanText(parent.textContent);
       }
 
-      if (qText && optionElements.length >= 2) {
-        const optionStrings = optionElements.map((o) => o.text);
-        const qId = generateQuestionId(qText, optionStrings);
-        const isAnswered = optionElements.some((opt) => isOptionSelected(opt.element));
-
-        domQuestionCache.set(qId, {
-          container,
-          options: optionElements,
-          questionText: qText,
-        });
-
-        detectedQuestions.push({
-          id: qId,
-          questionNumber: idx + 1,
-          questionText: qText.trim(),
-          options: optionStrings,
-          isAnswered,
-        });
+      if (optionText && optionText !== questionText && optionText.length > 0 && !seenTexts.has(optionText)) {
+        seenTexts.add(optionText);
+        options.push(optionText);
+        optionElements.push(targetClickElement);
       }
     });
 
-    return detectedQuestions;
+    const uniqueId = container.id || hashString(questionText);
+    container.setAttribute('data-gemini-qid', uniqueId);
+
+    return {
+      id: uniqueId,
+      questionNumber: index + 1,
+      questionText,
+      options,
+      isAnswered,
+      element: container,
+      optionElements,
+    };
   }
 
-  function isOptionSelected(element) {
+  function simulateUserClick(element) {
     if (!element) return false;
-    if (element.checked === true) return true;
-    if (element.getAttribute('aria-checked') === 'true') return true;
-    if (element.getAttribute('aria-selected') === 'true') return true;
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
-    const classNames = (element.className || '') + ' ' + (element.parentElement ? element.parentElement.className : '');
-    return /\\b(selected|checked|active|correct|is-selected|radio-checked)\\b/i.test(classNames);
-  }
-
-  function simulateUserClick(targetElement) {
-    if (!targetElement) return false;
-    targetElement.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
-
-    const rect = targetElement.getBoundingClientRect();
+    const rect = element.getBoundingClientRect();
     const clientX = rect.left + rect.width / 2;
     const clientY = rect.top + rect.height / 2;
 
-    const eventInit = {
+    const eventOpts = {
       bubbles: true,
       cancelable: true,
       view: window,
       clientX,
       clientY,
-      screenX: clientX,
-      screenY: clientY,
+      screenX: clientX + window.screenX,
+      screenY: clientY + window.screenY,
       button: 0,
       buttons: 1,
     };
 
-    targetElement.dispatchEvent(new PointerEvent('pointerover', eventInit));
-    targetElement.dispatchEvent(new MouseEvent('mouseover', eventInit));
-    targetElement.dispatchEvent(new PointerEvent('pointerdown', eventInit));
-    targetElement.dispatchEvent(new MouseEvent('mousedown', eventInit));
-    targetElement.focus();
-    targetElement.dispatchEvent(new PointerEvent('pointerup', eventInit));
-    targetElement.dispatchEvent(new MouseEvent('mouseup', eventInit));
-    targetElement.dispatchEvent(new MouseEvent('click', eventInit));
+    element.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+    element.dispatchEvent(new MouseEvent('mouseover', eventOpts));
+    element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+    element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+    element.focus();
+    element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+    element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+    element.dispatchEvent(new MouseEvent('click', eventOpts));
 
-    if (targetElement.tagName === 'INPUT') {
-      targetElement.checked = true;
-      targetElement.dispatchEvent(new Event('input', { bubbles: true }));
-      targetElement.dispatchEvent(new Event('change', { bubbles: true }));
+    const innerInput = element.querySelector('input[type="radio"], input[type="checkbox"]');
+    if (innerInput) {
+      innerInput.checked = true;
+      innerInput.dispatchEvent(new Event('change', { bubbles: true }));
+      innerInput.dispatchEvent(new Event('input', { bubbles: true }));
     }
+
+    if (element.tagName === 'INPUT' && (element.type === 'radio' || element.type === 'checkbox')) {
+      element.checked = true;
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
     return true;
   }
 
-  function detectCaptchaOnPage() {
-    const recaptcha = document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, #recaptcha, [id*="recaptcha"]');
-    if (recaptcha && recaptcha.offsetParent !== null) return { captchaDetected: true, captchaType: 'Google reCAPTCHA' };
-
-    const cloudflare = document.querySelector('iframe[src*="cloudflare"], iframe[src*="challenges.cloudflare.com"], .cf-turnstile, #challenge-running, #challenge-stage');
-    if (cloudflare && cloudflare.offsetParent !== null) return { captchaDetected: true, captchaType: 'Cloudflare Turnstile' };
-
-    const hcaptcha = document.querySelector('iframe[src*="hcaptcha"], .h-captcha');
-    if (hcaptcha && hcaptcha.offsetParent !== null) return { captchaDetected: true, captchaType: 'hCaptcha' };
-
-    return { captchaDetected: false };
-  }
-
-  function findQuizSubmitButton() {
-    const candidates = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, div[role="button"]'));
-    const submitKeywords = ['submit quiz', 'submit answers', 'submit exam', 'finish attempt', 'finish quiz', 'complete quiz', 'submit', 'finish'];
-    const forbiddenKeywords = ['cancel', 'clear', 'reset', 'previous', 'back', 'skip'];
-
-    for (const btn of candidates) {
-      if (btn.offsetParent === null) continue;
-      const text = (btn.innerText || btn.value || '').trim().toLowerCase();
-      if (!text || forbiddenKeywords.some((f) => text.includes(f))) continue;
-      if (submitKeywords.some((kw) => text.includes(kw))) return btn;
+  function findNextButton() {
+    for (const selector of SCAN_SELECTORS.nextButtons) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && el.offsetParent !== null) return el;
+      } catch (e) {}
     }
+
+    const allClickables = Array.from(document.querySelectorAll('button, input[type="button"], a, div[role="button"], span'));
+    const nextBtn = allClickables.find((btn) => {
+      if (btn.offsetParent === null) return false;
+      const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
+      const isSubmit = txt.includes('submit') || txt.includes('finish') || txt.includes('complete');
+      if (isSubmit) return false;
+      return (
+        txt === 'next' ||
+        txt === 'next ›' ||
+        txt === 'next >' ||
+        txt.includes('next ') ||
+        txt.includes('next›') ||
+        txt.includes('next>') ||
+        txt.includes('continue') ||
+        txt.includes('save & next') ||
+        txt.includes('save and next') ||
+        txt.includes('next question') ||
+        txt.includes('next page')
+      );
+    });
+
+    if (nextBtn) return nextBtn;
+
+    const activeNumberTab = document.querySelector('.pagination .active, [class*="active"], [aria-current="page"], .page-item.active');
+    if (activeNumberTab) {
+      const currentNum = parseInt(cleanText(activeNumberTab.textContent), 10);
+      if (!isNaN(currentNum)) {
+        const nextNum = currentNum + 1;
+        const allNumberTabs = Array.from(document.querySelectorAll('a, button, li, span, div'));
+        const nextTab = allNumberTabs.find((el) => {
+          return el.offsetParent !== null && cleanText(el.textContent) === String(nextNum);
+        });
+        if (nextTab) return nextTab;
+      }
+    }
+
     return null;
   }
 
-  function updateFloatingHud(statusText, countInfo) {
-    if (!floatingHudElement) {
-      floatingHudElement = document.createElement('div');
-      floatingHudElement.id = '__gemini_mcq_hud__';
-      floatingHudElement.style.cssText = \`
-        position: fixed;
-        top: 16px;
-        right: 16px;
-        z-index: 2147483647;
-        background: #0f172a;
-        color: #f8fafc;
-        padding: 10px 16px;
-        border-radius: 10px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        font-size: 13px;
-        font-weight: 500;
-        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.1);
-        display: flex;
-        align-items: center;
-        gap: 10px;
-      \`;
-      document.body.appendChild(floatingHudElement);
+  function findSubmitButton() {
+    for (const selector of SCAN_SELECTORS.submitButtons) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && el.offsetParent !== null) return el;
+      } catch (e) {}
     }
 
-    floatingHudElement.innerHTML = \`
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3b82f6;"></span>
-        <span style="font-weight:700;color:#60a5fa;">Gemini AI</span>
-      </div>
-      <span style="color:#94a3b8;">|</span>
-      <span style="color:#e2e8f0;">\${statusText}</span>
-      \${countInfo ? \`<span style="background:#1e293b;padding:2px 8px;border-radius:6px;font-size:11px;color:#38bdf8;">\${countInfo}</span>\` : ''}
-    \`;
+    const allButtons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a, div[role="button"]'));
+    const submitBtn = allButtons.find((btn) => {
+      if (btn.offsetParent === null) return false;
+      const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
+      return txt.includes('submit') || txt.includes('finish test') || txt.includes('complete quiz') || txt.includes('submit quiz');
+    });
+
+    return submitBtn || null;
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    const { type, questionId, optionIndex, delayMs, forceRetry } = message;
+    const { type, questionId, optionIndex, delayMs, stats, status } = message;
 
     switch (type) {
-      case 'CHECK_CAPTCHA':
-        sendResponse(detectCaptchaOnPage());
+      case 'CHECK_CAPTCHA': {
+        const result = checkForCaptcha();
+        sendResponse(result);
         break;
+      }
+
+      case 'UPDATE_HUD': {
+        createOrUpdateHud(stats, status);
+        sendResponse({ success: true });
+        break;
+      }
+
+      case 'REMOVE_HUD': {
+        removeHud();
+        sendResponse({ success: true });
+        break;
+      }
 
       case 'SCAN_PAGE': {
-        const questions = detectMcqsOnPage();
-        const scrollProgress = Math.round(((window.scrollY + window.innerHeight) / Math.max(document.documentElement.scrollHeight, 1)) * 100);
-        const bottomReached = (window.innerHeight + window.pageYOffset) >= (document.documentElement.scrollHeight - 60);
-        updateFloatingHud('Scanning Page', \`\${questions.length} detected\`);
-        sendResponse({ questions, scrollProgress, bottomReached });
+        const containers = findQuestionElements();
+        const questions = containers.map((c, idx) => {
+          const parsed = parseQuestion(c, idx);
+          return {
+            id: parsed.id,
+            questionNumber: parsed.questionNumber,
+            questionText: parsed.questionText,
+            options: parsed.options,
+            isAnswered: parsed.isAnswered,
+          };
+        });
+
+        const hasNextPage = !!findNextButton();
+        const hasSubmit = !!findSubmitButton();
+
+        const scrollY = window.scrollY || document.documentElement.scrollTop;
+        const totalHeight = document.documentElement.scrollHeight - window.innerHeight;
+        const scrollProgress = totalHeight > 0 ? Math.round((scrollY / totalHeight) * 100) : 100;
+        const bottomReached = scrollY + window.innerHeight >= document.documentElement.scrollHeight - 50;
+
+        sendResponse({
+          questions,
+          scrollProgress,
+          bottomReached,
+          hasNextPage,
+          hasSubmit,
+        });
         break;
       }
 
       case 'CLICK_ANSWER': {
-        const qData = domQuestionCache.get(questionId);
-        if (!qData || !qData.options[optionIndex]) {
-          sendResponse({ success: false });
+        const container = document.querySelector(\`[data-gemini-qid="\${questionId}"]\`) || document.getElementById(questionId);
+        if (!container) {
+          sendResponse({ success: false, error: 'Question container not found' });
           return;
         }
-        const optData = qData.options[optionIndex];
-        updateFloatingHud(\`Selecting Option \${optionIndex + 1}\`, optData.text.substring(0, 20));
-        const target = forceRetry ? (optData.element || optData.clickableTarget) : (optData.clickableTarget || optData.element);
-        const clicked = simulateUserClick(target);
-        sendResponse({ success: clicked });
+
+        let options = Array.from(
+          container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .test-option, [class*="option"]')
+        ).filter((el) => el.offsetParent !== null);
+
+        if (options.length === 0) {
+          options = Array.from(container.children).filter((c) => c.offsetParent !== null);
+        }
+
+        const targetOption = options[optionIndex];
+        if (!targetOption) {
+          sendResponse({ success: false, error: 'Option index out of bounds' });
+          return;
+        }
+
+        simulateUserClick(targetOption);
+        sendResponse({ success: true });
         break;
       }
 
       case 'VERIFY_CLICK': {
-        const qData = domQuestionCache.get(questionId);
-        if (!qData || !qData.options[optionIndex]) {
+        const container = document.querySelector(\`[data-gemini-qid="\${questionId}"]\`) || document.getElementById(questionId);
+        if (!container) {
           sendResponse({ verified: false });
           return;
         }
-        const optData = qData.options[optionIndex];
-        const isVerified = isOptionSelected(optData.element) || isOptionSelected(optData.clickableTarget);
-        if (isVerified) updateFloatingHud('Answer Verified', \`✓ \${optData.text.substring(0, 18)}\`);
-        sendResponse({ verified: isVerified });
+
+        const radios = container.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+        const ariaRadios = container.querySelectorAll('[role="radio"], [role="option"], label, .choice, .option, .test-option');
+
+        let verified = false;
+        if (radios[optionIndex] && radios[optionIndex].checked) verified = true;
+        if (ariaRadios[optionIndex]) {
+          const el = ariaRadios[optionIndex];
+          if (
+            el.getAttribute('aria-checked') === 'true' || 
+            el.getAttribute('aria-selected') === 'true' || 
+            el.classList.contains('selected') ||
+            el.classList.contains('active') ||
+            el.classList.contains('checked')
+          ) {
+            verified = true;
+          }
+        }
+
+        if (!verified) {
+          const checkedAny = container.querySelector('input:checked, [aria-checked="true"], [aria-selected="true"], .selected, .active');
+          if (checkedAny) verified = true;
+        }
+
+        sendResponse({ verified });
         break;
       }
 
       case 'SCROLL_STEP': {
-        const step = Math.min(window.innerHeight * 0.75, 600);
+        const step = window.innerHeight * 0.7;
         window.scrollBy({ top: step, behavior: 'smooth' });
         setTimeout(() => {
-          const bottomReached = (window.innerHeight + window.pageYOffset) >= (document.documentElement.scrollHeight - 60);
-          sendResponse({ bottomReached, scrollY: window.scrollY });
+          const scrollY = window.scrollY || document.documentElement.scrollTop;
+          const bottomReached = scrollY + window.innerHeight >= document.documentElement.scrollHeight - 60;
+          sendResponse({ bottomReached });
         }, delayMs || 600);
         return true;
       }
 
-      case 'FINAL_SCAN': {
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-        setTimeout(() => {
-          sendResponse({ questions: detectMcqsOnPage() });
-        }, 600);
-        return true;
+      case 'CLICK_NEXT_PAGE': {
+        const nextBtn = findNextButton();
+        if (nextBtn) {
+          simulateUserClick(nextBtn);
+          sendResponse({ success: true, clicked: true });
+        } else {
+          sendResponse({ success: false, clicked: false, error: 'Next button not found' });
+        }
+        break;
       }
 
       case 'PERFORM_SUBMIT': {
-        updateFloatingHud('Submitting Quiz...', 'Final Action');
-        const submitBtn = findQuizSubmitButton();
+        const submitBtn = findSubmitButton();
         if (submitBtn) {
           simulateUserClick(submitBtn);
-          sendResponse({ submitted: true, buttonText: submitBtn.innerText || submitBtn.value });
+          sendResponse({ submitted: true });
         } else {
-          sendResponse({ submitted: false });
+          sendResponse({ submitted: false, error: 'Submit button not located' });
         }
         break;
       }
 
       case 'VERIFY_SUBMISSION': {
-        updateFloatingHud('Quiz Complete!', '✓ Done');
-        sendResponse({ confirmed: true, message: 'Submission completed' });
+        const pageText = document.body.innerText.toLowerCase();
+        const successKeywords = ['submitted', 'score', 'congratulations', 'completed', 'results', 'graded', 'thank you'];
+        const found = successKeywords.find((kw) => pageText.includes(kw));
+        sendResponse({
+          verified: !!found,
+          message: found ? \`Submission detected (\${found})\` : 'Submitted successfully',
+        });
         break;
       }
 
       default:
-        sendResponse({ error: 'Unknown action' });
+        sendResponse({ error: 'Unknown content script action' });
     }
   });
 })();`,
@@ -802,248 +1128,632 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Gemini Auto MCQ Solver</title>
+  <title>Gemini MCQ Solver</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="app-container">
+  <div class="popup-container">
     <header class="header">
       <div class="brand">
-        <div class="logo-icon">⚡</div>
-        <div class="title-group">
+        <div class="logo">G</div>
+        <div>
           <h1>Gemini MCQ Solver</h1>
-          <span class="version-tag">Manifest V3</span>
+          <p class="subtitle">Autonomous Quiz Agent (MV3)</p>
         </div>
       </div>
-      <a href="options.html" target="_blank" class="icon-btn" title="Settings">⚙️</a>
+      <div class="header-actions">
+        <button id="btnOptions" title="Options" class="icon-btn">⚙️</button>
+      </div>
     </header>
 
-    <div class="target-tab-card">
+    <div id="keyMissingAlert" class="key-alert" style="display: none;">
+      <div class="key-alert-header">
+        <span class="key-icon">🔑</span>
+        <span class="key-alert-title">Gemini API Key Required</span>
+      </div>
+      <p class="key-alert-desc">Enter your Google AI Studio API key to enable autonomous AI answering:</p>
+      <div class="key-input-group">
+        <input type="password" id="inputApiKey" placeholder="Paste Gemini API Key (AIzaSy...)" autocomplete="off">
+        <button id="btnSaveKey" class="btn-save-key">Save</button>
+      </div>
+      <a href="https://aistudio.google.com/app/apikey" target="_blank" class="key-link">Get Free Gemini API Key →</a>
+    </div>
+
+    <div id="keyConnectedBar" class="key-connected-bar" style="display: none;">
+      <div class="key-connected-info">
+        <span class="dot-green"></span>
+        <span class="key-status-text">Gemini AI Connected</span>
+      </div>
+      <span id="modelBadge" class="badge">gemini-3.7-flash</span>
+    </div>
+
+    <div class="card target-card">
       <div class="target-info">
-        <span class="target-label">TARGET TAB</span>
-        <div class="tab-title" id="tabTitle">Active Webpage</div>
+        <span class="label">TARGET TAB LOCK</span>
+        <div id="targetTabTitle" class="tab-title">No Active Tab Locked</div>
       </div>
-      <div class="status-pill" id="statusPill">
-        <span class="status-dot"></span>
-        <span id="statusText">IDLE</span>
-      </div>
+      <div id="statusBadge" class="status-badge status-idle">IDLE</div>
+    </div>
+
+    <div class="progress-bar-container">
+      <div id="progressBar" class="progress-bar" style="width: 0%;"></div>
     </div>
 
     <div class="stats-grid">
       <div class="stat-box">
-        <span class="stat-val" id="statDetected">0</span>
+        <span class="stat-num" id="statDetected">0</span>
         <span class="stat-lbl">Detected</span>
       </div>
-      <div class="stat-box">
-        <span class="stat-val stat-success" id="statAnswered">0</span>
+      <div class="stat-box stat-highlight">
+        <span class="stat-num" id="statAnswered">0</span>
         <span class="stat-lbl">Answered</span>
       </div>
       <div class="stat-box">
-        <span class="stat-val stat-warn" id="statRemaining">0</span>
+        <span class="stat-num" id="statRemaining">0</span>
         <span class="stat-lbl">Remaining</span>
       </div>
     </div>
 
-    <div class="current-task-box">
-      <div class="task-header">
-        <span class="task-tag" id="currentQuestionTag">CURRENT QUESTION</span>
-        <span class="confidence-tag" id="confidenceTag">Confidence: --</span>
-      </div>
-      <div class="task-text" id="currentQuestionText">Ready to start scan on current tab...</div>
+    <div class="active-question-card" id="activeQuestionCard" style="display: none;">
+      <span class="label">ACTIVE QUESTION</span>
+      <p id="activeQuestionText" class="active-q-text">Scanning for questions...</p>
     </div>
 
-    <div class="controls-group">
-      <button id="btnStart" class="btn btn-primary">Start Solving</button>
-      <div class="btn-row" id="activeControls" style="display: none;">
-        <button id="btnPause" class="btn btn-secondary">Pause</button>
-        <button id="btnResume" class="btn btn-secondary" style="display: none;">Resume</button>
-        <button id="btnStop" class="btn btn-danger">Stop</button>
+    <div class="actions">
+      <button id="btnStart" class="btn btn-primary">
+        <span class="icon">▶</span>
+        <span>Start Autonomous Solver</span>
+      </button>
+
+      <div id="runningControls" class="btn-group" style="display: none;">
+        <button id="btnPause" class="btn btn-warning">
+          <span>⏸ Pause</span>
+        </button>
+        <button id="btnStop" class="btn btn-secondary">
+          <span>⏹ Stop</span>
+        </button>
       </div>
     </div>
 
-    <div class="toggles-card">
-      <label class="toggle-row">
-        <span>Auto-Submit Quiz upon completion</span>
+    <div class="toggle-row">
+      <span>Auto-Submit quiz on complete</span>
+      <label class="switch">
         <input type="checkbox" id="toggleAutoSubmit" checked>
-        <span class="switch"></span>
-      </label>
-      <label class="toggle-row">
-        <span>Show On-Page Floating HUD</span>
-        <input type="checkbox" id="toggleHud" checked>
-        <span class="switch"></span>
+        <span class="slider round"></span>
       </label>
     </div>
 
-    <div class="logs-container">
-      <div class="logs-header">
-        <span>LIVE LOG STREAM</span>
-        <button id="btnClearLogs" class="btn-link">Clear</button>
+    <div class="terminal">
+      <div class="terminal-header">
+        <span class="pulse-dot"></span>
+        <span class="terminal-title">AGENT_STREAM</span>
       </div>
-      <div class="logs-list" id="logsList"></div>
+      <div id="logStream" class="log-stream">
+        <div class="log-entry log-info">> Ready. Click Start to begin.</div>
+      </div>
     </div>
   </div>
+
   <script src="popup.js"></script>
 </body>
 </html>`,
 
-  'popup.css': `:root {
-  --bg-main: #090d16;
-  --bg-card: #111827;
-  --border-color: #1e293b;
-  --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --accent: #3b82f6;
-  --success: #10b981;
-  --warn: #f59e0b;
-  --danger: #ef4444;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-body { width: 380px; background: var(--bg-main); color: var(--text-primary); font-size: 13px; }
-.app-container { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-.header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; }
-.brand { display: flex; align-items: center; gap: 8px; }
-.logo-icon { font-size: 20px; }
-.title-group h1 { font-size: 14px; font-weight: 700; }
-.version-tag { font-size: 10px; background: #1e293b; color: #38bdf8; padding: 1px 6px; border-radius: 4px; }
-.target-tab-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; display: flex; justify-content: space-between; align-items: center; }
-.target-label { font-size: 9px; font-weight: 700; color: #64748b; }
-.tab-title { font-size: 12px; font-weight: 600; max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.status-pill { padding: 4px 8px; border-radius: 9999px; background: #1e293b; font-size: 10px; font-weight: 700; }
-.stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-.stat-box { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 8px; text-align: center; }
-.stat-val { font-size: 18px; font-weight: 700; }
-.stat-success { color: var(--success); }
-.stat-warn { color: var(--warn); }
-.stat-lbl { font-size: 10px; color: var(--text-secondary); }
-.current-task-box { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 8px 10px; }
-.task-header { display: flex; justify-content: space-between; font-size: 10px; font-weight: 700; color: #64748b; margin-bottom: 2px; }
-.confidence-tag { color: #38bdf8; }
-.task-text { font-size: 11px; color: var(--text-secondary); }
-.btn { padding: 8px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; border: none; width: 100%; font-size: 12px; }
-.btn-primary { background: var(--accent); color: #fff; }
-.btn-secondary { background: #1e293b; color: #fff; border: 1px solid var(--border-color); }
-.btn-danger { background: rgba(239, 68, 68, 0.2); color: #f87171; }
-.btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-.toggles-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; font-size: 11px; }
-.toggle-row { display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
-.logs-container { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 8px; }
-.logs-header { display: flex; justify-content: space-between; font-size: 9px; font-weight: 700; color: #64748b; margin-bottom: 4px; }
-.logs-list { max-height: 100px; overflow-y: auto; font-family: monospace; font-size: 10px; display: flex; flex-direction: column; gap: 2px; }
-.log-item { display: flex; gap: 4px; }
-.log-item.info { color: #94a3b8; }
-.log-item.success { color: #34d399; }
-.log-item.warn { color: #fbbf24; }
-.log-item.error { color: #f87171; }`,
+  'popup.js': `/**
+ * Gemini Auto MCQ Solver - Popup Controller
+ */
 
-  'popup.js': `document.addEventListener('DOMContentLoaded', async () => {
-  const tabTitle = document.getElementById('tabTitle');
-  const statusPill = document.getElementById('statusPill');
-  const statusText = document.getElementById('statusText');
+document.addEventListener('DOMContentLoaded', async () => {
+  const targetTabTitle = document.getElementById('targetTabTitle');
+  const statusBadge = document.getElementById('statusBadge');
+  const progressBar = document.getElementById('progressBar');
   const statDetected = document.getElementById('statDetected');
   const statAnswered = document.getElementById('statAnswered');
   const statRemaining = document.getElementById('statRemaining');
-  const currentQuestionText = document.getElementById('currentQuestionText');
-  const currentQuestionTag = document.getElementById('currentQuestionTag');
-  const confidenceTag = document.getElementById('confidenceTag');
+  const activeQuestionCard = document.getElementById('activeQuestionCard');
+  const activeQuestionText = document.getElementById('activeQuestionText');
   const btnStart = document.getElementById('btnStart');
-  const activeControls = document.getElementById('activeControls');
+  const runningControls = document.getElementById('runningControls');
   const btnPause = document.getElementById('btnPause');
-  const btnResume = document.getElementById('btnResume');
   const btnStop = document.getElementById('btnStop');
   const toggleAutoSubmit = document.getElementById('toggleAutoSubmit');
-  const toggleHud = document.getElementById('toggleHud');
-  const logsList = document.getElementById('logsList');
-  const btnClearLogs = document.getElementById('btnClearLogs');
+  const logStream = document.getElementById('logStream');
+  const btnOptions = document.getElementById('btnOptions');
+  const modelBadge = document.getElementById('modelBadge');
 
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (tabs && tabs[0]) tabTitle.innerText = tabs[0].title || 'Active Tab';
+  const keyMissingAlert = document.getElementById('keyMissingAlert');
+  const keyConnectedBar = document.getElementById('keyConnectedBar');
+  const inputApiKey = document.getElementById('inputApiKey');
+  const btnSaveKey = document.getElementById('btnSaveKey');
+
+  btnOptions.addEventListener('click', () => {
+    chrome.runtime.openOptionsPage();
   });
 
-  chrome.runtime.sendMessage({ type: 'GET_STATE' }, (response) => {
-    if (response && response.state) renderState(response.state);
+  btnSaveKey.addEventListener('click', async () => {
+    const keyVal = inputApiKey.value.trim();
+    if (!keyVal) return;
+    await chrome.runtime.sendMessage({
+      type: 'UPDATE_CONFIG',
+      payload: { apiKey: keyVal },
+    });
+    keyMissingAlert.style.display = 'none';
+    keyConnectedBar.style.display = 'flex';
   });
 
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message.type === 'STATE_UPDATED' && message.state) renderState(message.state);
-  });
-
-  function renderState(state) {
-    if (!state) return;
-    statusText.innerText = state.status;
-    statDetected.innerText = state.stats.detected || 0;
-    statAnswered.innerText = state.stats.answered || 0;
-    statRemaining.innerText = state.stats.remaining || 0;
-    currentQuestionText.innerText = state.stats.currentQuestionText || state.status;
-    const isRunning = state.status !== 'IDLE' && state.status !== 'COMPLETED';
-    btnStart.style.display = isRunning ? 'none' : 'block';
-    activeControls.style.display = isRunning ? 'grid' : 'none';
-
-    if (state.logs) {
-      logsList.innerHTML = state.logs.slice(0, 20).map((l) => \`<div class="log-item \${l.level}"><span>\${l.timestamp}</span> <span>\${l.message}</span></div>\`).join('');
-    }
+  const response = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+  if (response && response.state) {
+    updateUI(response.state);
   }
 
-  btnStart.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'START_AUTOMATION' }));
-  btnPause.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'PAUSE_AUTOMATION' }));
-  btnResume.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'RESUME_AUTOMATION' }));
-  btnStop.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'STOP_AUTOMATION' }));
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (activeTab && (!response?.state?.targetTabId || response.state.status === 'IDLE')) {
+    targetTabTitle.textContent = activeTab.title || 'Current Tab';
+  }
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message.type === 'STATE_UPDATED' && message.state) {
+      updateUI(message.state);
+    }
+  });
+
+  btnStart.addEventListener('click', async () => {
+    const res = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+    const config = res?.state?.config;
+    if (!config?.apiKey && !config?.apiEndpoint) {
+      keyMissingAlert.style.display = 'flex';
+      inputApiKey.focus();
+      return;
+    }
+
+    btnStart.disabled = true;
+    btnStart.textContent = 'Starting...';
+    await chrome.runtime.sendMessage({ type: 'START_AUTOMATION' });
+  });
+
+  btnPause.addEventListener('click', async () => {
+    const res = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+    if (res?.state?.status === 'PAUSED' || res?.state?.status === 'PAUSED_CAPTCHA') {
+      await chrome.runtime.sendMessage({ type: 'RESUME_AUTOMATION' });
+    } else {
+      await chrome.runtime.sendMessage({ type: 'PAUSE_AUTOMATION' });
+    }
+  });
+
+  btnStop.addEventListener('click', async () => {
+    await chrome.runtime.sendMessage({ type: 'STOP_AUTOMATION' });
+  });
+
+  toggleAutoSubmit.addEventListener('change', async (e) => {
+    await chrome.runtime.sendMessage({
+      type: 'UPDATE_CONFIG',
+      payload: { autoSubmit: e.target.checked },
+    });
+  });
+
+  function updateUI(state) {
+    const { status, stats, targetTabInfo, logs, config } = state;
+
+    const hasKey = !!(config?.apiKey || config?.apiEndpoint);
+    if (!hasKey) {
+      keyMissingAlert.style.display = 'flex';
+      keyConnectedBar.style.display = 'none';
+    } else {
+      keyMissingAlert.style.display = 'none';
+      keyConnectedBar.style.display = 'flex';
+    }
+
+    if (config?.model) {
+      modelBadge.textContent = config.model;
+    }
+    if (config?.autoSubmit !== undefined) {
+      toggleAutoSubmit.checked = config.autoSubmit;
+    }
+
+    if (targetTabInfo) {
+      targetTabTitle.textContent = targetTabInfo.title;
+    }
+
+    statusBadge.textContent = status;
+    statusBadge.className = 'status-badge';
+    if (status === 'IDLE') statusBadge.classList.add('status-idle');
+    else if (status === 'COMPLETED') statusBadge.classList.add('status-completed');
+    else if (status.includes('PAUSED')) statusBadge.classList.add('status-paused');
+    else statusBadge.classList.add('status-running');
+
+    statDetected.textContent = stats.detected;
+    statAnswered.textContent = stats.answered;
+    statRemaining.textContent = stats.remaining;
+
+    const percent = stats.detected > 0 ? Math.round((stats.answered / stats.detected) * 100) : 0;
+    progressBar.style.width = \`\${percent}%\`;
+
+    if (stats.currentQuestionText && status !== 'IDLE' && status !== 'COMPLETED') {
+      activeQuestionCard.style.display = 'block';
+      activeQuestionText.textContent = stats.currentQuestionText;
+    } else {
+      activeQuestionCard.style.display = 'none';
+    }
+
+    const isRunning =
+      status === 'RUNNING' ||
+      status === 'SCANNING' ||
+      status === 'SOLVING' ||
+      status === 'CLICKING' ||
+      status === 'VERIFYING' ||
+      status === 'SCROLLING' ||
+      status === 'SUBMITTING';
+    const isPaused = status === 'PAUSED' || status === 'PAUSED_CAPTCHA';
+
+    if (isRunning || isPaused) {
+      btnStart.style.display = 'none';
+      runningControls.style.display = 'grid';
+      btnPause.querySelector('span').textContent = isPaused ? '▶ Resume' : '⏸ Pause';
+      btnPause.className = isPaused ? 'btn btn-primary' : 'btn btn-warning';
+    } else {
+      btnStart.style.display = 'flex';
+      btnStart.disabled = false;
+      btnStart.innerHTML = '<span class="icon">▶</span><span>Start Autonomous Solver</span>';
+      runningControls.style.display = 'none';
+    }
+
+    if (logs && logs.length > 0) {
+      logStream.innerHTML = '';
+      logs.slice(0, 10).forEach((l) => {
+        const div = document.createElement('div');
+        div.className = \`log-entry log-\${l.level}\`;
+        div.textContent = \`> \${l.message}\`;
+        logStream.appendChild(div);
+      });
+    }
+  }
 });`,
+
+  'popup.css': `* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background-color: #ffffff;
+  color: #0f172a;
+  width: 370px;
+  min-height: 490px;
+}
+
+.popup-container {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #f1f5f9;
+  padding-bottom: 10px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: #4f46e5;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 15px;
+}
+
+h1 { font-size: 13px; font-weight: 700; color: #0f172a; }
+.subtitle { font-size: 10px; color: #64748b; font-weight: 500; }
+.header-actions { display: flex; align-items: center; gap: 6px; }
+.badge { font-size: 9px; font-weight: 700; background: #eef2ff; color: #4338ca; padding: 2px 6px; border-radius: 12px; font-family: monospace; }
+.icon-btn { background: transparent; border: none; font-size: 14px; cursor: pointer; padding: 2px; }
+
+.key-alert {
+  background: #fef3c7;
+  border: 1px solid #fde68a;
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.key-alert-header { display: flex; align-items: center; gap: 6px; }
+.key-alert-title { font-size: 11px; font-weight: 700; color: #92400e; }
+.key-alert-desc { font-size: 10px; color: #78350f; line-height: 1.3; }
+.key-input-group { display: flex; gap: 6px; margin-top: 4px; }
+.key-input-group input { flex: 1; padding: 6px 8px; border: 1px solid #fcd34d; border-radius: 6px; font-size: 11px; outline: none; background: #ffffff; }
+.key-input-group input:focus { border-color: #4f46e5; }
+.btn-save-key { padding: 6px 12px; background: #4f46e5; color: #ffffff; border: none; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer; }
+.btn-save-key:hover { background: #4338ca; }
+.key-link { font-size: 10px; color: #4f46e5; text-decoration: none; font-weight: 600; margin-top: 2px; }
+.key-link:hover { text-decoration: underline; }
+
+.key-connected-bar {
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 10px;
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.key-connected-info { display: flex; align-items: center; gap: 6px; }
+.dot-green { width: 7px; height: 7px; border-radius: 50%; background: #16a34a; }
+.key-status-text { font-size: 10px; font-weight: 700; color: #166534; }
+
+.card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px 12px; }
+.target-card { display: flex; align-items: center; justify-content: space-between; }
+.label { font-size: 8px; font-weight: 800; letter-spacing: 0.5px; color: #94a3b8; display: block; }
+.tab-title { font-size: 11px; font-weight: 600; color: #334155; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 190px; }
+
+.status-badge { font-size: 9px; font-weight: 700; padding: 2px 8px; border-radius: 12px; text-transform: uppercase; }
+.status-idle { background: #f1f5f9; color: #64748b; }
+.status-running { background: #e0e7ff; color: #4338ca; }
+.status-paused { background: #fef3c7; color: #92400e; }
+.status-completed { background: #dcfce7; color: #166534; }
+
+.progress-bar-container { width: 100%; height: 4px; background: #f1f5f9; border-radius: 2px; overflow: hidden; }
+.progress-bar { height: 100%; background: #4f46e5; transition: width 0.3s ease; }
+
+.stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stat-box { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 8px 4px; text-align: center; }
+.stat-num { font-size: 16px; font-weight: 800; color: #0f172a; display: block; }
+.stat-highlight .stat-num { color: #16a34a; }
+.stat-lbl { font-size: 9px; font-weight: 600; color: #64748b; text-transform: uppercase; }
+
+.active-question-card { background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 10px; padding: 8px 10px; }
+.active-q-text { font-size: 10px; color: #312e81; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.btn {
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 0.2s ease;
+}
+
+.btn-primary { background: #4f46e5; color: #ffffff; box-shadow: 0 4px 12px rgba(79, 70, 229, 0.25); }
+.btn-primary:hover { background: #4338ca; }
+.btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; width: 100%; }
+.btn-warning { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
+.btn-warning:hover { background: #fde68a; }
+.btn-secondary { background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0; }
+.btn-secondary:hover { background: #e2e8f0; }
+
+.toggle-row { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: #475569; font-weight: 500; padding: 2px 4px; }
+
+.switch { position: relative; display: inline-block; width: 32px; height: 18px; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #cbd5e1; transition: .3s; border-radius: 18px; }
+.slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 2px; bottom: 2px; background-color: white; transition: .3s; border-radius: 50%; }
+input:checked + .slider { background-color: #10b981; }
+input:checked + .slider:before { transform: translateX(14px); }
+
+.terminal { background: #090d16; border-radius: 10px; padding: 10px; color: #cbd5e1; font-family: monospace; font-size: 10px; border: 1px solid #1e293b; }
+.terminal-header { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid #1e293b; padding-bottom: 6px; margin-bottom: 6px; }
+.pulse-dot { width: 6px; height: 6px; border-radius: 50%; background: #6366f1; }
+.terminal-title { color: #818cf8; font-weight: 700; }
+.log-stream { max-height: 80px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
+.log-entry { line-height: 1.3; }
+.log-gemini { color: #c084fc; font-weight: bold; }
+.log-success { color: #4ade80; }
+.log-warn { color: #fde047; }
+.log-error { color: #f87171; }`,
 
   'options.html': `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Settings - Gemini MCQ Solver</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gemini MCQ Solver - Extension Options</title>
   <style>
-    body { background: #090d16; color: #f8fafc; font-family: sans-serif; padding: 30px; max-width: 600px; margin: 0 auto; }
-    h1 { font-size: 20px; margin-bottom: 16px; }
-    .card { background: #111827; border: 1px solid #1e293b; padding: 16px; border-radius: 8px; margin-bottom: 16px; }
-    label { display: block; font-size: 12px; font-weight: bold; margin-bottom: 4px; }
-    input, select { width: 100%; padding: 8px; background: #0b1120; border: 1px solid #1e293b; color: #fff; border-radius: 6px; box-sizing: border-box; margin-bottom: 12px; }
-    button { background: #3b82f6; color: #fff; border: none; padding: 10px 20px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+      padding: 40px 20px;
+    }
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #f1f5f9;
+    }
+    .logo {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: #4f46e5;
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 20px;
+    }
+    h1 { font-size: 18px; font-weight: 700; }
+    p.desc { font-size: 13px; color: #64748b; margin-top: 2px; }
+    .form-group { margin-bottom: 20px; }
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: #334155;
+      margin-bottom: 6px;
+    }
+    input[type="text"], input[type="password"], input[type="number"], select {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus, select:focus {
+      border-color: #4f46e5;
+      box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+    }
+    .hint { font-size: 11px; color: #94a3b8; margin-top: 4px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .btn-save {
+      background: #4f46e5;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 10px;
+    }
+    .btn-save:hover { background: #4338ca; }
+    .toast {
+      display: none;
+      background: #dcfce7;
+      border: 1px solid #86efac;
+      color: #166534;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-top: 16px;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
-  <h1>Gemini MCQ Solver Options</h1>
-  <div class="card">
-    <label>Gemini API Key</label>
-    <input type="password" id="apiKey" placeholder="AIzaSy...">
-    <label>Server Proxy Endpoint (Optional)</label>
-    <input type="text" id="apiEndpoint" placeholder="https://your-domain.com/api/gemini/solve">
-    <label>Model</label>
-    <select id="model">
-      <option value="gemini-3.7-flash" selected>gemini-3.7-flash</option>
-      <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
-    </select>
+  <div class="container">
+    <div class="header">
+      <div class="logo">G</div>
+      <div>
+        <h1>Gemini MCQ Solver Settings</h1>
+        <p class="desc">Configure Gemini API key, model, and automation timings</p>
+      </div>
+    </div>
+
+    <form id="optionsForm">
+      <div class="form-group">
+        <label for="apiKey">Gemini API Key</label>
+        <input type="password" id="apiKey" placeholder="AIzaSy...">
+        <p class="hint">Obtain from Google AI Studio. Stored securely in your browser's extension storage.</p>
+      </div>
+
+      <div class="form-group">
+        <label for="model">Gemini Model</label>
+        <select id="model">
+          <option value="gemini-3.7-flash">gemini-3.7-flash (Recommended, Fastest)</option>
+          <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+          <option value="gemini-2.5-pro">gemini-2.5-pro (Deep reasoning)</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="apiEndpoint">Custom Backend Proxy URL (Optional)</label>
+        <input type="text" id="apiEndpoint" placeholder="https://your-domain.com/api/gemini/solve">
+        <p class="hint">Leave blank to call Google Gemini API directly from the background service worker.</p>
+      </div>
+
+      <div class="grid">
+        <div class="form-group">
+          <label for="clickDelayMs">Click Delay (ms)</label>
+          <input type="number" id="clickDelayMs" min="200" max="3000" step="50" value="600">
+        </div>
+        <div class="form-group">
+          <label for="scrollDelayMs">Scroll Step Delay (ms)</label>
+          <input type="number" id="scrollDelayMs" min="300" max="4000" step="50" value="900">
+        </div>
+      </div>
+
+      <button type="submit" class="btn-save">Save Settings</button>
+      <div id="toast" class="toast">✓ Settings saved successfully!</div>
+    </form>
   </div>
-  <button id="saveBtn">Save Settings</button>
+
   <script src="options.js"></script>
 </body>
 </html>`,
 
-  'options.js': `document.addEventListener('DOMContentLoaded', () => {
-  const apiKey = document.getElementById('apiKey');
-  const apiEndpoint = document.getElementById('apiEndpoint');
-  const model = document.getElementById('model');
-  const saveBtn = document.getElementById('saveBtn');
+  'options.js': `/**
+ * Gemini Auto MCQ Solver - Options Controller
+ */
 
-  chrome.storage.local.get(['config'], (res) => {
-    if (res.config) {
-      if (res.config.apiKey) apiKey.value = res.config.apiKey;
-      if (res.config.apiEndpoint) apiEndpoint.value = res.config.apiEndpoint;
-      if (res.config.model) model.value = res.config.model;
-    }
-  });
+document.addEventListener('DOMContentLoaded', async () => {
+  const form = document.getElementById('optionsForm');
+  const apiKeyInput = document.getElementById('apiKey');
+  const modelSelect = document.getElementById('model');
+  const apiEndpointInput = document.getElementById('apiEndpoint');
+  const clickDelayInput = document.getElementById('clickDelayMs');
+  const scrollDelayInput = document.getElementById('scrollDelayMs');
+  const toast = document.getElementById('toast');
 
-  saveBtn.addEventListener('click', () => {
+  const stored = await chrome.storage.local.get(['config']);
+  const config = stored.config || {};
+
+  if (config.apiKey) apiKeyInput.value = config.apiKey;
+  if (config.model) modelSelect.value = config.model;
+  if (config.apiEndpoint) apiEndpointInput.value = config.apiEndpoint;
+  if (config.clickDelayMs) clickDelayInput.value = config.clickDelayMs;
+  if (config.scrollDelayMs) scrollDelayInput.value = config.scrollDelayMs;
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const updatedConfig = {
+      ...config,
+      apiKey: apiKeyInput.value.trim(),
+      model: modelSelect.value,
+      apiEndpoint: apiEndpointInput.value.trim(),
+      clickDelayMs: parseInt(clickDelayInput.value, 10) || 600,
+      scrollDelayMs: parseInt(scrollDelayInput.value, 10) || 900,
+    };
+
+    await chrome.storage.local.set({ config: updatedConfig });
     chrome.runtime.sendMessage({
       type: 'UPDATE_CONFIG',
-      payload: {
-        apiKey: apiKey.value.trim(),
-        apiEndpoint: apiEndpoint.value.trim(),
-        model: model.value
-      }
-    }, () => alert('Settings Saved!'));
+      payload: updatedConfig,
+    });
+
+    toast.style.display = 'block';
+    setTimeout(() => {
+      toast.style.display = 'none';
+    }, 3000);
   });
 });`,
 };

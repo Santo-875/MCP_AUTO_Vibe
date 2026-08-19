@@ -11,11 +11,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   const scrollDelayInput = document.getElementById('scrollDelayMs');
   const toast = document.getElementById('toast');
 
-  const stored = await chrome.storage.local.get(['config']);
+  const stored = await chrome.storage.local.get(['config', 'gemini_api_key', 'gemini_model']);
   const config = stored.config || {};
 
-  if (config.apiKey) apiKeyInput.value = config.apiKey;
-  if (config.model) modelSelect.value = config.model;
+  const savedKey = stored.gemini_api_key || config.apiKey || '';
+  if (savedKey) apiKeyInput.value = savedKey;
+  if (stored.gemini_model || config.model) modelSelect.value = stored.gemini_model || config.model;
   if (config.apiEndpoint) apiEndpointInput.value = config.apiEndpoint;
   if (config.clickDelayMs) clickDelayInput.value = config.clickDelayMs;
   if (config.scrollDelayMs) scrollDelayInput.value = config.scrollDelayMs;
@@ -23,16 +24,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
 
+    const keyVal = apiKeyInput.value.trim();
+    const modelVal = modelSelect.value;
+
     const updatedConfig = {
       ...config,
-      apiKey: apiKeyInput.value.trim(),
-      model: modelSelect.value,
+      apiKey: keyVal,
+      model: modelVal,
       apiEndpoint: apiEndpointInput.value.trim(),
-      clickDelayMs: parseInt(clickDelayInput.value, 10) || 600,
-      scrollDelayMs: parseInt(scrollDelayInput.value, 10) || 900,
+      clickDelayMs: parseInt(clickDelayInput.value, 10) || 500,
+      scrollDelayMs: parseInt(scrollDelayInput.value, 10) || 800,
     };
 
-    await chrome.storage.local.set({ config: updatedConfig });
+    await chrome.storage.local.set({
+      config: updatedConfig,
+      gemini_api_key: keyVal,
+      gemini_model: modelVal,
+    });
+
     chrome.runtime.sendMessage({
       type: 'UPDATE_CONFIG',
       payload: updatedConfig,

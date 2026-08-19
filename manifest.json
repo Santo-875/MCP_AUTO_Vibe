@@ -2,12 +2,13 @@
   "manifest_version": 3,
   "name": "Gemini Auto MCQ & Quiz Solver",
   "version": "1.0.0",
-  "description": "Autonomous AI agent using Gemini to detect, solve, click, verify, scroll, and complete MCQ quiz pages.",
+  "description": "Autonomous AI agent using Gemini to detect, solve, click, verify, navigate pages, and complete MCQ quiz pages in background.",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
-    "tabs"
+    "tabs",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"

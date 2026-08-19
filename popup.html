@@ -14,14 +14,35 @@
         <div class="logo">G</div>
         <div>
           <h1>Gemini MCQ Solver</h1>
-          <p class="subtitle">Autonomous Quiz Agent</p>
+          <p class="subtitle">Autonomous Quiz Agent (MV3)</p>
         </div>
       </div>
       <div class="header-actions">
-        <span id="modelBadge" class="badge">gemini-3.7-flash</span>
         <button id="btnOptions" title="Options" class="icon-btn">⚙️</button>
       </div>
     </header>
+
+    <!-- Gemini Key Connection Banner / Quick Setup -->
+    <div id="keyMissingAlert" class="key-alert" style="display: none;">
+      <div class="key-alert-header">
+        <span class="key-icon">🔑</span>
+        <span class="key-alert-title">Gemini API Key Required</span>
+      </div>
+      <p class="key-alert-desc">Enter your Google AI Studio API key to enable autonomous AI answering:</p>
+      <div class="key-input-group">
+        <input type="password" id="inputApiKey" placeholder="Paste Gemini API Key (AIzaSy...)" autocomplete="off">
+        <button id="btnSaveKey" class="btn-save-key">Save</button>
+      </div>
+      <a href="https://aistudio.google.com/app/apikey" target="_blank" class="key-link">Get Free Gemini API Key →</a>
+    </div>
+
+    <div id="keyConnectedBar" class="key-connected-bar" style="display: none;">
+      <div class="key-connected-info">
+        <span class="dot-green"></span>
+        <span class="key-status-text">Gemini AI Connected</span>
+      </div>
+      <span id="modelBadge" class="badge">gemini-3.7-flash</span>
+    </div>
 
     <!-- Target Tab Status Card -->
     <div class="card target-card">
@@ -54,7 +75,7 @@
 
     <!-- Active Question Preview -->
     <div class="active-question-card" id="activeQuestionCard" style="display: none;">
-      <span class="label">CURRENT ACTIVE QUESTION</span>
+      <span class="label">ACTIVE QUESTION</span>
       <p id="activeQuestionText" class="active-q-text">Scanning for questions...</p>
     </div>
 
@@ -62,7 +83,7 @@
     <div class="actions">
       <button id="btnStart" class="btn btn-primary">
         <span class="icon">▶</span>
-        <span>Start Solving</span>
+        <span>Start Autonomous Solver</span>
       </button>
 
       <div id="runningControls" class="btn-group" style="display: none;">
@@ -84,7 +105,7 @@
       </label>
     </div>
 
-    <!-- Agent Thoughts Terminal -->
+    <!-- Agent Stream Terminal -->
     <div class="terminal">
       <div class="terminal-header">
         <span class="pulse-dot"></span>

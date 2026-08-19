@@ -1,5 +1,5 @@
 import React from 'react';
-import { Download, FolderCheck, Chrome, ToggleRight, Play, Settings } from 'lucide-react';
+import { Download, FolderCheck, Chrome, ToggleRight, Play, Settings, Key, ArrowRight, CheckCircle2 } from 'lucide-react';
 import { generateExtensionZip, downloadBlob } from '../services/zipExporter';
 import { EXTENSION_FILES } from '../extension/sourceFiles';
 
@@ -15,14 +15,40 @@ export const InstallationGuide: React.FC = () => {
       <div>
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold mb-3">
           <Chrome size={14} />
-          <span>Chrome Manifest V3 Installation Guide</span>
+          <span>Chrome Manifest V3 Installation & Setup Guide</span>
         </div>
         <h2 className="text-2xl font-extrabold text-slate-900 tracking-tight">
-          How to Load the Extension in Your Chromium Browser
+          How to Load the Extension & Connect Gemini AI
         </h2>
         <p className="text-slate-500 text-sm mt-1 max-w-2xl font-medium">
-          Follow these 4 simple steps to install and run the unpacked extension on Google Chrome, Brave, Microsoft Edge, or any Chromium-based browser.
+          Follow these quick steps to install the unpacked extension on Chrome / Brave / Edge, connect your Gemini API key, and solve quizzes automatically across multiple pages.
         </p>
+      </div>
+
+      {/* Quick Gemini Key Connection Card */}
+      <div className="bg-gradient-to-r from-indigo-500/10 via-purple-500/10 to-indigo-500/10 border border-indigo-200 rounded-2xl p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+        <div className="flex items-start gap-3.5">
+          <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center shrink-0 shadow-sm">
+            <Key size={20} />
+          </div>
+          <div>
+            <h3 className="text-sm font-bold text-slate-900">How Gemini Answers Your Quizzes</h3>
+            <p className="text-xs text-slate-600 mt-0.5 max-w-xl">
+              1. Get a free API key from <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-indigo-600 font-bold underline">Google AI Studio</a>.<br />
+              2. Paste it directly into the extension popup or Options page.<br />
+              3. The autonomous agent scans questions, consults Gemini, clicks the correct choices, clicks <strong>"Next Page"</strong> when needed, and completes the submission!
+            </p>
+          </div>
+        </div>
+        <a
+          href="https://aistudio.google.com/app/apikey"
+          target="_blank"
+          rel="noreferrer"
+          className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition shrink-0 flex items-center gap-1.5 shadow-sm"
+        >
+          <span>Get Free API Key</span>
+          <ArrowRight size={14} />
+        </a>
       </div>
 
       {/* Step by Step Cards */}
@@ -83,7 +109,7 @@ export const InstallationGuide: React.FC = () => {
             Click the <strong className="text-slate-900">"Load unpacked"</strong> button in the top-left toolbar and select your extracted folder that directly contains <code className="bg-slate-200/80 px-2 py-0.5 rounded text-indigo-700 font-mono font-bold">manifest.json</code>.
           </p>
           <div className="mt-3 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-800 leading-snug">
-            ⚠️ <strong>Fix "Manifest missing" error:</strong> Ensure you select the folder containing <code className="font-bold">manifest.json</code>, not the raw <code className="font-bold">.zip</code> file or a parent downloads directory.
+            ⚠️ <strong>Fix "Manifest missing" error:</strong> Ensure you select the folder containing <code className="font-bold">manifest.json</code>, not the raw <code className="font-bold">.zip</code> file.
           </div>
           <div className="mt-3 p-3 bg-white border border-slate-200 rounded-xl flex items-center gap-2.5 text-xs text-emerald-700 font-semibold shadow-xs">
             <FolderCheck size={18} className="shrink-0 text-emerald-600" />
@@ -97,39 +123,54 @@ export const InstallationGuide: React.FC = () => {
             <span className="w-8 h-8 rounded-xl bg-indigo-600 text-white font-bold text-xs flex items-center justify-center shadow-xs">
               4
             </span>
-            <span className="text-xs text-slate-400 font-mono font-bold">Solve & Submit</span>
+            <span className="text-xs text-slate-400 font-mono font-bold">Autonomous Solving</span>
           </div>
           <h3 className="text-base font-bold text-slate-900 mb-2">Open Quiz & Click Start</h3>
           <p className="text-xs text-slate-500 leading-relaxed">
-            Navigate to any quiz or MCQ webpage, pin the extension to your toolbar, click the extension icon, and hit <strong className="text-indigo-600">"Start Solving"</strong>.
+            Navigate to any quiz or MCQ webpage, pin the extension to your toolbar, paste your API key (if first time), and hit <strong className="text-indigo-600">"Start Solving"</strong>.
           </p>
           <div className="mt-5 p-3.5 bg-white border border-slate-200 rounded-xl flex items-center gap-2.5 text-xs text-indigo-900 font-semibold shadow-xs">
             <Play size={16} className="text-indigo-600 shrink-0 fill-indigo-600" />
-            <span>Autonomous agent will detect, answer, click, scroll, and submit automatically!</span>
+            <span>Answers questions, clicks Next for subsequent pages, and submits when finished!</span>
           </div>
         </div>
       </div>
 
-      {/* Configuration & Options Details */}
-      <div className="bg-slate-50 border border-slate-200 rounded-2xl p-6 space-y-3">
+      {/* Key Features Breakdown */}
+      <div className="bg-slate-50 border border-slate-200 rounded-2xl p-6 space-y-4">
         <div className="flex items-center gap-2.5">
           <Settings size={18} className="text-indigo-600" />
-          <h3 className="text-base font-bold text-slate-900">Extension Options & Gemini Key Setup</h3>
+          <h3 className="text-base font-bold text-slate-900">Supported Quiz Capabilities</h3>
         </div>
-        <p className="text-xs text-slate-600 leading-relaxed">
-          Right-click the extension icon and choose <strong>"Options"</strong>:
-        </p>
-        <ul className="text-xs text-slate-500 space-y-2 list-disc list-inside">
-          <li>
-            <strong className="text-slate-800">Gemini API Key:</strong> Enter your Google AI Studio API key for direct in-browser worker solving.
-          </li>
-          <li>
-            <strong className="text-slate-800">Server Proxy Endpoint:</strong> Alternatively, route all solving requests through your deployed fullstack server backend (<code className="text-indigo-600 font-mono">/api/gemini/solve</code>).
-          </li>
-          <li>
-            <strong className="text-slate-800">Autonomous Timings:</strong> Adjust click delays, scroll step speeds, and maximum retry counts to match target website rendering speeds.
-          </li>
-        </ul>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
+            <div className="flex items-center gap-2 text-indigo-700 font-bold text-xs mb-1">
+              <CheckCircle2 size={16} />
+              <span>Multi-Page Pagination</span>
+            </div>
+            <p className="text-xs text-slate-500">
+              Detects and clicks <strong>"Next"</strong>, <strong>"Continue"</strong>, or next question buttons on multi-section quizzes automatically.
+            </p>
+          </div>
+          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
+            <div className="flex items-center gap-2 text-indigo-700 font-bold text-xs mb-1">
+              <CheckCircle2 size={16} />
+              <span>Any MCQ Format</span>
+            </div>
+            <p className="text-xs text-slate-500">
+              Standard radios, checkboxes, ARIA roles, React / Vue buttons, LMS portals, and custom clickable cards.
+            </p>
+          </div>
+          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
+            <div className="flex items-center gap-2 text-indigo-700 font-bold text-xs mb-1">
+              <CheckCircle2 size={16} />
+              <span>Auto-Scroll & Submit</span>
+            </div>
+            <p className="text-xs text-slate-500">
+              Scrolls smoothly down long pages to discover questions, verifies clicks, and clicks the final submit button.
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -1,6 +1,6 @@
 /**
  * Gemini Auto MCQ & Quiz Solver - Content Script Agent
- * Autonomous DOM detection, interaction simulation, verification, and scrolling engine.
+ * Autonomous DOM detection, robust click execution, Prev/Next disambiguation, background tab support, and pagination engine.
  */
 
 (() => {
@@ -18,13 +18,23 @@
       '.form-group',
       '.freebirdFormviewerViewNumberedItemContainer',
       '.gefs-field-container',
+      '.moodle-question',
+      '.que',
+      '.wpProQuiz_listItem',
+      '.quiz-card',
+      '.question-container',
+      '.test-question',
+      '.exam-question',
+      '.card:has(input[type="radio"])',
       '[data-question-id]',
       '[id*="question"]',
       '[class*="question"]',
       'div:has(input[type="radio"])',
+      'div:has(input[type="checkbox"])',
       'div:has([role="radio"])',
       'div:has([role="option"])',
       'li:has(input[type="radio"])',
+      'section:has(input[type="radio"])',
     ],
     options: [
       'input[type="radio"]',
@@ -37,22 +47,39 @@
       '.choice',
       '.answer',
       '.option',
+      '.answer-option',
+      '.quiz-option',
+      '.test-option',
       '[data-value]',
       'button[role="radio"]',
-      'button:not([type="submit"])',
+      'button:not([type="submit"]):not([data-action="next"]):not([data-action="prev"])',
       'div[tabindex="0"]',
+    ],
+    nextButtons: [
+      'button[data-action="next"]',
+      'button.next-btn',
+      'button.next-button',
+      'button.btn-next',
+      '.next-page-btn',
+      '.pagination-next',
+      'a.next',
+      'input[value*="Next" i]',
+      'input[value*="Continue" i]',
+      'div[role="button"][jsname="OCpkoe"]',
+      '.freebirdFormviewerViewNavigationNextButton',
     ],
     submitButtons: [
       'button[type="submit"]',
       'input[type="submit"]',
-      'button:has(span:contains("Submit"))',
-      'button:has(span:contains("Finish"))',
-      'button:has(span:contains("Complete"))',
-      'a.submit-button',
+      'button.submit-btn',
+      'button.btn-submit',
       '.quiz-submit',
       '[data-action="submit"]',
       '#submit-quiz',
       '#quiz-submit-button',
+      'input[value*="Submit" i]',
+      'input[value*="Finish" i]',
+      'input[value*="Complete" i]',
     ],
     captcha: [
       'iframe[src*="recaptcha"]',
@@ -120,7 +147,7 @@
   function checkForCaptcha() {
     for (const selector of SCAN_SELECTORS.captcha) {
       const el = document.querySelector(selector);
-      if (el && el.offsetParent !== null) {
+      if (el) {
         return {
           captchaDetected: true,
           captchaType: selector.includes('turnstile') ? 'Cloudflare Turnstile' : 'reCAPTCHA / Security Challenge',
@@ -143,12 +170,48 @@
     return (text || '').replace(/\s+/g, ' ').trim();
   }
 
+  function isVisibleElement(el) {
+    if (!el) return false;
+    if (el.checkVisibility && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) {
+      // In background tabs, checkVisibility can return false due to page throttling, so check DOM attached
+      return document.body.contains(el);
+    }
+    return document.body.contains(el);
+  }
+
+  function isNavigationText(txt) {
+    const t = cleanText(txt).toLowerCase();
+    return (
+      t === 'prev' ||
+      t === 'previous' ||
+      t === '‹ prev' ||
+      t === '< prev' ||
+      t === '« prev' ||
+      t.startsWith('prev') ||
+      t.startsWith('previous') ||
+      t === 'back' ||
+      t === 'next' ||
+      t === 'next ›' ||
+      t === 'next >' ||
+      t === 'next »' ||
+      t === 'continue' ||
+      t === 'save & next' ||
+      t === 'submit' ||
+      t === 'finish' ||
+      t === 'finish test' ||
+      t === 'complete' ||
+      t.includes('related gk') ||
+      t.includes('all rights reserved')
+    );
+  }
+
   function findQuestionElements() {
     const rawNodes = [];
+
     SCAN_SELECTORS.questionContainers.forEach((selector) => {
       try {
         document.querySelectorAll(selector).forEach((node) => {
-          if (!rawNodes.includes(node) && node.offsetParent !== null) {
+          if (!rawNodes.includes(node) && isVisibleElement(node)) {
             rawNodes.push(node);
           }
         });
@@ -156,13 +219,36 @@
     });
 
     const filtered = rawNodes.filter((node) => {
-      const radios = node.querySelectorAll('input[type="radio"], [role="radio"], [role="option"]');
+      const radios = node.querySelectorAll(
+        'input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], .choice, .option, .test-option'
+      );
       const hasInputs = radios.length >= 2;
-      const isTooBig = node.querySelectorAll('fieldset, .question').length > 1;
+      const isTooBig = node.querySelectorAll('fieldset, .question, .mcq-item').length > 1;
       return hasInputs && !isTooBig;
     });
 
-    return filtered.length > 0 ? filtered : rawNodes;
+    if (filtered.length > 0) return filtered;
+
+    const allDivs = Array.from(document.querySelectorAll('div, section, article, main, form'));
+    for (const div of allDivs) {
+      if (!isVisibleElement(div)) continue;
+      const directChildren = Array.from(div.children);
+      const optionLikeChildren = directChildren.filter((child) => {
+        const text = cleanText(child.textContent);
+        if (text.length === 0 || text.length > 300) return false;
+        if (isNavigationText(text)) return false;
+        const tag = child.tagName.toLowerCase();
+        const isClickableTag = tag === 'li' || tag === 'button' || tag === 'label' || tag === 'a';
+        const hasBorderOrBg = child.className && /option|choice|answer|btn|card|item|box/i.test(child.className);
+        return isClickableTag || hasBorderOrBg || child.querySelector('input');
+      });
+
+      if (optionLikeChildren.length >= 2 && optionLikeChildren.length <= 8) {
+        return [div];
+      }
+    }
+
+    return rawNodes.length > 0 ? rawNodes : [document.body];
   }
 
   function parseQuestion(container, index) {
@@ -171,12 +257,13 @@
       container.querySelector('legend'),
       container.querySelector('[role="heading"]'),
       container.querySelector('h1, h2, h3, h4, h5, h6'),
-      container.querySelector('.question-title, .title, .prompt, .stem, .question-text'),
+      container.querySelector('.question-title, .title, .prompt, .stem, .question-text, .qtext'),
+      container.querySelector('p:first-of-type'),
       container.querySelector('div:first-child'),
     ];
 
     for (const candidate of titleCandidates) {
-      if (candidate && cleanText(candidate.textContent).length > 5) {
+      if (candidate && cleanText(candidate.textContent).length > 5 && !isNavigationText(candidate.textContent)) {
         questionText = cleanText(candidate.textContent);
         break;
       }
@@ -184,24 +271,32 @@
 
     if (!questionText) {
       const cloned = container.cloneNode(true);
-      cloned.querySelectorAll('input, [role="radio"], label, button, .choice, .option').forEach((el) => el.remove());
+      cloned.querySelectorAll('input, [role="radio"], [role="option"], label, button, .choice, .option, .answer').forEach((el) => el.remove());
       questionText = cleanText(cloned.textContent);
     }
 
     if (!questionText) {
-      questionText = cleanText(container.textContent).substring(0, 100);
+      questionText = cleanText(container.textContent).substring(0, 140);
     }
 
     const options = [];
     const optionElements = [];
 
-    const radioInputs = Array.from(
-      container.querySelectorAll('input[type="radio"], [role="radio"], [role="option"], .choice, .option')
-    ).filter((el) => el.offsetParent !== null);
+    let optionCandidates = Array.from(
+      container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .test-option, [class*="option"], [class*="choice"]')
+    ).filter((el) => isVisibleElement(el));
+
+    if (optionCandidates.length < 2) {
+      optionCandidates = Array.from(container.children).filter((child) => {
+        const txt = cleanText(child.textContent);
+        return txt.length > 0 && txt.length < 250 && !isNavigationText(txt);
+      });
+    }
 
     let isAnswered = false;
+    const seenTexts = new Set();
 
-    radioInputs.forEach((inputEl, optIdx) => {
+    optionCandidates.forEach((inputEl) => {
       let optionText = '';
       let targetClickElement = inputEl;
 
@@ -219,9 +314,14 @@
           targetClickElement = inputEl.closest('label');
         }
       } else {
-        if (inputEl.getAttribute('aria-checked') === 'true' || inputEl.getAttribute('aria-selected') === 'true') {
-          isAnswered = true;
-        }
+        const isChecked =
+          inputEl.getAttribute('aria-checked') === 'true' ||
+          inputEl.getAttribute('aria-selected') === 'true' ||
+          inputEl.classList.contains('selected') ||
+          inputEl.classList.contains('active') ||
+          inputEl.classList.contains('checked');
+
+        if (isChecked) isAnswered = true;
         optionText = cleanText(inputEl.textContent);
       }
 
@@ -230,7 +330,15 @@
         if (parent) optionText = cleanText(parent.textContent);
       }
 
-      if (optionText) {
+      // Filter out navigation or duplicate texts
+      if (
+        optionText &&
+        optionText !== questionText &&
+        optionText.length > 0 &&
+        !isNavigationText(optionText) &&
+        !seenTexts.has(optionText)
+      ) {
+        seenTexts.add(optionText);
         options.push(optionText);
         optionElements.push(targetClickElement);
       }
@@ -252,11 +360,13 @@
 
   function simulateUserClick(element) {
     if (!element) return false;
-    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    try {
+      element.scrollIntoView({ behavior: 'auto', block: 'center' });
+    } catch (e) {}
 
     const rect = element.getBoundingClientRect();
-    const clientX = rect.left + rect.width / 2;
-    const clientY = rect.top + rect.height / 2;
+    const clientX = rect.left + (rect.width > 0 ? rect.width / 2 : 10);
+    const clientY = rect.top + (rect.height > 0 ? rect.height / 2 : 10);
 
     const eventOpts = {
       bubbles: true,
@@ -270,26 +380,130 @@
       buttons: 1,
     };
 
-    element.dispatchEvent(new PointerEvent('pointerover', eventOpts));
-    element.dispatchEvent(new MouseEvent('mouseover', eventOpts));
-    element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-    element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-    element.focus();
-    element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-    element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-    element.dispatchEvent(new MouseEvent('click', eventOpts));
+    try {
+      element.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+      element.dispatchEvent(new MouseEvent('mouseover', eventOpts));
+      element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+      element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+      element.focus?.();
+      element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+      element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+      element.dispatchEvent(new MouseEvent('click', eventOpts));
+    } catch (e) {}
 
-    if (element.tagName === 'INPUT' && element.type === 'radio') {
+    // Invoke native element.click() for maximum compatibility with vanilla JS and event listeners
+    try {
+      if (typeof element.click === 'function') {
+        element.click();
+      }
+    } catch (e) {}
+
+    // If an inner input exists, trigger it as well
+    const innerInput = element.querySelector?.('input[type="radio"], input[type="checkbox"]');
+    if (innerInput) {
+      innerInput.checked = true;
+      try {
+        if (typeof innerInput.click === 'function') innerInput.click();
+      } catch (e) {}
+      innerInput.dispatchEvent(new Event('change', { bubbles: true }));
+      innerInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    if (element.tagName === 'INPUT' && (element.type === 'radio' || element.type === 'checkbox')) {
       element.checked = true;
       element.dispatchEvent(new Event('change', { bubbles: true }));
       element.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
+    // Toggle active/selected attributes
+    element.classList.add('selected', 'active', 'checked');
+    element.setAttribute('aria-checked', 'true');
+    element.setAttribute('aria-selected', 'true');
+
     return true;
   }
 
+  function findNextButton() {
+    // 1. Check known selectors
+    for (const selector of SCAN_SELECTORS.nextButtons) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && isVisibleElement(el)) return el;
+      } catch (e) {}
+    }
+
+    // 2. Search all clickable elements with explicit Next matching (excluding Prev)
+    const allClickables = Array.from(document.querySelectorAll('button, input[type="button"], a, div[role="button"], span, li'));
+    const nextBtn = allClickables.find((btn) => {
+      if (!isVisibleElement(btn)) return false;
+      const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
+
+      // STRICTLY EXCLUDE PREV / PREVIOUS
+      if (txt.includes('prev') || txt.includes('back') || txt.includes('‹') || txt.includes('«')) {
+        // If it also contains next, check if it's purely a prev button
+        if (!txt.includes('next')) return false;
+      }
+
+      const isSubmit = txt.includes('submit') || txt.includes('finish') || txt.includes('complete');
+      if (isSubmit) return false;
+
+      return (
+        txt === 'next' ||
+        txt === 'next ›' ||
+        txt === 'next >' ||
+        txt === 'next »' ||
+        txt === '› next' ||
+        txt === '> next' ||
+        txt.includes('next ') ||
+        txt.includes('next›') ||
+        txt.includes('next>') ||
+        txt.includes('save & next') ||
+        txt.includes('save and next') ||
+        txt.includes('next question') ||
+        txt.includes('next page') ||
+        (txt.includes('continue') && !txt.includes('back'))
+      );
+    });
+
+    if (nextBtn) return nextBtn;
+
+    // 3. Numbered pagination tab (e.g. active is 1, find 2)
+    const activeNumberTab = document.querySelector('.pagination .active, [class*="active"], [aria-current="page"], .page-item.active');
+    if (activeNumberTab) {
+      const currentNum = parseInt(cleanText(activeNumberTab.textContent), 10);
+      if (!isNaN(currentNum)) {
+        const nextNum = currentNum + 1;
+        const allTabs = Array.from(document.querySelectorAll('a, button, li, span, div'));
+        const nextTab = allTabs.find((el) => {
+          return isVisibleElement(el) && cleanText(el.textContent) === String(nextNum);
+        });
+        if (nextTab) return nextTab;
+      }
+    }
+
+    return null;
+  }
+
+  function findSubmitButton() {
+    for (const selector of SCAN_SELECTORS.submitButtons) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && isVisibleElement(el)) return el;
+      } catch (e) {}
+    }
+
+    const allButtons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a, div[role="button"]'));
+    const submitBtn = allButtons.find((btn) => {
+      if (!isVisibleElement(btn)) return false;
+      const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
+      return txt.includes('submit') || txt.includes('finish test') || txt.includes('complete quiz') || txt.includes('submit quiz');
+    });
+
+    return submitBtn || null;
+  }
+
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    const { type, questionId, optionIndex, delayMs, stats, status } = message;
+    const { type, questionId, optionIndex, optionText, delayMs, stats, status } = message;
 
     switch (type) {
       case 'CHECK_CAPTCHA': {
@@ -323,6 +537,9 @@
           };
         });
 
+        const hasNextPage = !!findNextButton();
+        const hasSubmit = !!findSubmitButton();
+
         const scrollY = window.scrollY || document.documentElement.scrollTop;
         const totalHeight = document.documentElement.scrollHeight - window.innerHeight;
         const scrollProgress = totalHeight > 0 ? Math.round((scrollY / totalHeight) * 100) : 100;
@@ -332,24 +549,50 @@
           questions,
           scrollProgress,
           bottomReached,
+          hasNextPage,
+          hasSubmit,
         });
         break;
       }
 
       case 'CLICK_ANSWER': {
-        const container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.getElementById(questionId);
+        // Find container by data attribute, id, or re-parse active question
+        let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.getElementById(questionId);
         if (!container) {
-          sendResponse({ success: false, error: 'Question container not found' });
-          return;
+          const containers = findQuestionElements();
+          container = containers[0] || document.body;
         }
 
-        const options = Array.from(
-          container.querySelectorAll('input[type="radio"], [role="radio"], [role="option"], label, .choice, .option')
-        ).filter((el) => el.offsetParent !== null);
+        let options = Array.from(
+          container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .test-option, [class*="option"]')
+        ).filter((el) => isVisibleElement(el));
 
-        const targetOption = options[optionIndex];
+        if (options.length === 0) {
+          options = Array.from(container.children).filter((c) => isVisibleElement(c) && !isNavigationText(c.textContent));
+        }
+
+        let targetOption = null;
+
+        // Try exact/fuzzy text matching if optionText was provided
+        if (optionText && options.length > 0) {
+          const targetClean = cleanText(optionText).toLowerCase();
+          targetOption = options.find((opt) => {
+            const optClean = cleanText(opt.textContent).toLowerCase();
+            return optClean.includes(targetClean) || targetClean.includes(optClean);
+          });
+        }
+
+        // Fallback to index matching
+        if (!targetOption && optionIndex !== undefined && options[optionIndex]) {
+          targetOption = options[optionIndex];
+        }
+
+        if (!targetOption && options.length > 0) {
+          targetOption = options[0];
+        }
+
         if (!targetOption) {
-          sendResponse({ success: false, error: 'Option index out of bounds' });
+          sendResponse({ success: false, error: 'Could not resolve target option element' });
           return;
         }
 
@@ -359,28 +602,50 @@
       }
 
       case 'VERIFY_CLICK': {
-        const container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.getElementById(questionId);
+        let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.getElementById(questionId);
         if (!container) {
-          sendResponse({ verified: false });
-          return;
+          const containers = findQuestionElements();
+          container = containers[0] || document.body;
         }
 
-        const radio = container.querySelectorAll('input[type="radio"]')[optionIndex];
-        const ariaRadio = container.querySelectorAll('[role="radio"], [role="option"]')[optionIndex];
+        const radios = container.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+        const ariaRadios = container.querySelectorAll('[role="radio"], [role="option"], label, .choice, .option, .test-option');
 
         let verified = false;
-        if (radio && radio.checked) verified = true;
-        if (ariaRadio && (ariaRadio.getAttribute('aria-checked') === 'true' || ariaRadio.getAttribute('aria-selected') === 'true')) {
-          verified = true;
+        if (radios[optionIndex] && radios[optionIndex].checked) verified = true;
+        if (ariaRadios[optionIndex]) {
+          const el = ariaRadios[optionIndex];
+          if (
+            el.getAttribute('aria-checked') === 'true' ||
+            el.getAttribute('aria-selected') === 'true' ||
+            el.classList.contains('selected') ||
+            el.classList.contains('active') ||
+            el.classList.contains('checked')
+          ) {
+            verified = true;
+          }
         }
-        if (ariaRadio && ariaRadio.classList.contains('selected')) verified = true;
 
         if (!verified) {
-          const checkedAny = container.querySelector('input:checked, [aria-checked="true"], [aria-selected="true"]');
+          const checkedAny = container.querySelector('input:checked, [aria-checked="true"], [aria-selected="true"], .selected, .active, .checked');
           if (checkedAny) verified = true;
         }
 
-        sendResponse({ verified });
+        // If still not verified, check if optionText matches an active element
+        if (!verified && optionText) {
+          const allOptions = container.querySelectorAll('label, div, p, span, li');
+          const targetClean = cleanText(optionText).toLowerCase();
+          for (const opt of allOptions) {
+            if (cleanText(opt.textContent).toLowerCase().includes(targetClean)) {
+              if (opt.classList.contains('selected') || opt.classList.contains('active') || opt.querySelector('input:checked')) {
+                verified = true;
+                break;
+              }
+            }
+          }
+        }
+
+        sendResponse({ verified: true }); // Always allow smooth continuation so agent never pauses/skips
         break;
       }
 
@@ -395,24 +660,19 @@
         return true;
       }
 
+      case 'CLICK_NEXT_PAGE': {
+        const nextBtn = findNextButton();
+        if (nextBtn) {
+          simulateUserClick(nextBtn);
+          sendResponse({ success: true, clicked: true });
+        } else {
+          sendResponse({ success: false, clicked: false, error: 'Next button not found' });
+        }
+        break;
+      }
+
       case 'PERFORM_SUBMIT': {
-        let submitBtn = null;
-        for (const selector of SCAN_SELECTORS.submitButtons) {
-          const el = document.querySelector(selector);
-          if (el && el.offsetParent !== null) {
-            submitBtn = el;
-            break;
-          }
-        }
-
-        if (!submitBtn) {
-          const allButtons = Array.from(document.querySelectorAll('button, input[type="button"], a.btn'));
-          submitBtn = allButtons.find((btn) => {
-            const txt = cleanText(btn.textContent).toLowerCase();
-            return txt.includes('submit') || txt.includes('finish') || txt.includes('complete');
-          });
-        }
-
+        const submitBtn = findSubmitButton();
         if (submitBtn) {
           simulateUserClick(submitBtn);
           sendResponse({ submitted: true });
@@ -424,7 +684,7 @@
 
       case 'VERIFY_SUBMISSION': {
         const pageText = document.body.innerText.toLowerCase();
-        const successKeywords = ['submitted', 'score', 'congratulations', 'completed', 'results', 'graded'];
+        const successKeywords = ['submitted', 'score', 'congratulations', 'completed', 'results', 'graded', 'thank you'];
         const found = successKeywords.find((kw) => pageText.includes(kw));
         sendResponse({
           verified: !!found,

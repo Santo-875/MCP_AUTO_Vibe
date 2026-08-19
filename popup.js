@@ -20,12 +20,41 @@ document.addEventListener('DOMContentLoaded', async () => {
   const btnOptions = document.getElementById('btnOptions');
   const modelBadge = document.getElementById('modelBadge');
 
+  const keyMissingAlert = document.getElementById('keyMissingAlert');
+  const keyConnectedBar = document.getElementById('keyConnectedBar');
+  const inputApiKey = document.getElementById('inputApiKey');
+  const btnSaveKey = document.getElementById('btnSaveKey');
+
   btnOptions.addEventListener('click', () => {
     chrome.runtime.openOptionsPage();
   });
 
+  // Persistent storage key loader
+  const storedData = await chrome.storage.local.get(['gemini_api_key', 'config']);
+  const savedKey = storedData.gemini_api_key || storedData.config?.apiKey || '';
+  if (savedKey) {
+    inputApiKey.value = savedKey;
+    keyMissingAlert.style.display = 'none';
+    keyConnectedBar.style.display = 'flex';
+  }
+
+  btnSaveKey.addEventListener('click', async () => {
+    const keyVal = inputApiKey.value.trim();
+    if (!keyVal) return;
+    await chrome.storage.local.set({ gemini_api_key: keyVal });
+    await chrome.runtime.sendMessage({
+      type: 'UPDATE_CONFIG',
+      payload: { apiKey: keyVal },
+    });
+    keyMissingAlert.style.display = 'none';
+    keyConnectedBar.style.display = 'flex';
+  });
+
   const response = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
   if (response && response.state) {
+    if (savedKey && !response.state.config.apiKey) {
+      response.state.config.apiKey = savedKey;
+    }
     updateUI(response.state);
   }
 
@@ -41,6 +70,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   btnStart.addEventListener('click', async () => {
+    const stored = await chrome.storage.local.get(['gemini_api_key', 'config']);
+    const hasKey = stored.gemini_api_key || stored.config?.apiKey;
+    if (!hasKey) {
+      keyMissingAlert.style.display = 'flex';
+      inputApiKey.focus();
+      return;
+    }
+
     btnStart.disabled = true;
     btnStart.textContent = 'Starting...';
     await chrome.runtime.sendMessage({ type: 'START_AUTOMATION' });
@@ -68,6 +105,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function updateUI(state) {
     const { status, stats, targetTabInfo, logs, config } = state;
+
+    const hasKey = !!(config?.apiKey || inputApiKey.value.trim());
+    if (!hasKey) {
+      keyMissingAlert.style.display = 'flex';
+      keyConnectedBar.style.display = 'none';
+    } else {
+      keyMissingAlert.style.display = 'none';
+      keyConnectedBar.style.display = 'flex';
+    }
 
     if (config?.model) {
       modelBadge.textContent = config.model;
@@ -115,22 +161,35 @@ document.addEventListener('DOMContentLoaded', async () => {
       btnStart.style.display = 'none';
       runningControls.style.display = 'grid';
       btnPause.querySelector('span').textContent = isPaused ? '▶ Resume' : '⏸ Pause';
-      btnPause.className = isPaused ? 'btn btn-primary' : 'btn btn-warning';
     } else {
       btnStart.style.display = 'flex';
       btnStart.disabled = false;
-      btnStart.innerHTML = '<span class="icon">▶</span><span>Start Autonomous Solver</span>';
+      btnStart.textContent = '🚀 Start Auto Solver';
       runningControls.style.display = 'none';
     }
 
+    // Render Logs Stream
     if (logs && logs.length > 0) {
-      logStream.innerHTML = '';
-      logs.slice(0, 10).forEach((l) => {
-        const div = document.createElement('div');
-        div.className = `log-entry log-${l.level}`;
-        div.textContent = `> ${l.message}`;
-        logStream.appendChild(div);
-      });
+      logStream.innerHTML = logs
+        .slice(0, 30)
+        .map(
+          (l) => `
+          <div class="log-item">
+            <span class="log-time">${l.timestamp}</span>
+            <span class="log-badge ${l.level}">${l.level}</span>
+            <span class="log-msg">${escapeHtml(l.message)}</span>
+          </div>
+        `
+        )
+        .join('');
     }
+  }
+
+  function escapeHtml(str) {
+    return (str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
   }
 });
