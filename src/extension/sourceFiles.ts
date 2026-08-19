@@ -235,218 +235,261 @@ Respond in structured JSON format with:
   };
 }
 
+let isLoopRunning = false;
+let isAutomationActive = false;
+
+/**
+ * Main Autonomous Automation Loop (Works in background even if user is in another tab!)
+ */
 async function runAutomationLoop(tabId) {
-  if (sessionState.targetTabId !== tabId) return;
+  if (isLoopRunning) {
+    log('info', 'Automation loop is already active.');
+    return;
+  }
 
-  let pageLoopCount = 0;
-  const MAX_PAGE_LOOPS = 50;
+  isLoopRunning = true;
+  isAutomationActive = true;
+  sessionState.status = 'RUNNING';
+  broadcastState();
 
-  while (
-    sessionState.targetTabId === tabId &&
-    pageLoopCount < MAX_PAGE_LOOPS &&
-    (sessionState.status === 'RUNNING' ||
-      sessionState.status === 'SCANNING' ||
-      sessionState.status === 'SOLVING' ||
-      sessionState.status === 'CLICKING' ||
-      sessionState.status === 'VERIFYING' ||
-      sessionState.status === 'SCROLLING')
-  ) {
-    pageLoopCount++;
-    try {
-      const captchaCheck = await chrome.tabs.sendMessage(tabId, { type: 'CHECK_CAPTCHA' });
-      if (captchaCheck && captchaCheck.captchaDetected) {
-        log('warn', \`Security Challenge / CAPTCHA detected (\${captchaCheck.captchaType}). Pausing automation.\`);
-        sessionState.status = 'PAUSED_CAPTCHA';
+  let loopIterations = 0;
+  const MAX_ITERATIONS = 500;
+
+  try {
+    while (isAutomationActive && sessionState.status !== 'PAUSED' && sessionState.status !== 'COMPLETED' && sessionState.status !== 'IDLE' && loopIterations < MAX_ITERATIONS) {
+      loopIterations++;
+
+      try {
+        // 1. Verify target tab exists (even if backgrounded)
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (!tab) {
+            log('warn', 'Target tab not accessible. Stopping.');
+            isAutomationActive = false;
+            resetSession('IDLE');
+            break;
+          }
+        } catch (e) {
+          log('warn', 'Target tab lost. Stopping.');
+          isAutomationActive = false;
+          resetSession('IDLE');
+          break;
+        }
+
+        // 2. Scan DOM for questions & navigation
+        sessionState.status = 'SCANNING';
         broadcastState();
-        return;
-      }
 
-      sessionState.status = 'SCANNING';
-      broadcastState();
-      const scanResult = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_PAGE' });
+        let scanResult;
+        try {
+          scanResult = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_PAGE' });
+        } catch (e) {
+          // Re-inject content script if needed
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId },
+              files: ['content.js'],
+            });
+            await new Promise((r) => setTimeout(r, 200));
+            scanResult = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_PAGE' });
+          } catch (injectErr) {
+            log('error', \`Script communication error: \${injectErr.message}\`);
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+          }
+        }
 
-      if (scanResult && scanResult.questions) {
-        scanResult.questions.forEach((q) => {
+        if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
+
+        if (!scanResult || !scanResult.questions) {
+          await new Promise((r) => setTimeout(r, 800));
+          continue;
+        }
+
+        const scannedQuestions = scanResult.questions || [];
+
+        // Update question registry
+        scannedQuestions.forEach((q) => {
           if (!sessionState.questions[q.id]) {
             sessionState.questions[q.id] = {
               ...q,
-              status: q.isAnswered ? 'ANSWERED' : 'UNANSWERED',
+              status: q.isAnswered ? 'VERIFIED' : 'PENDING',
               retries: 0,
-              verified: q.isAnswered || false,
+              selectedOptionIndex: null,
+              selectedOptionText: null,
+              confidence: null,
+              rationale: null,
+              verified: q.isAnswered,
             };
+          } else if (q.isAnswered) {
+            sessionState.questions[q.id].verified = true;
+            sessionState.questions[q.id].status = 'VERIFIED';
           }
         });
-      }
 
-      const allQList = Object.values(sessionState.questions);
-      const unansweredQList = allQList.filter((q) => q.status === 'UNANSWERED' || q.status === 'FAILED');
-      const answeredCount = allQList.filter((q) => q.status === 'ANSWERED' || q.status === 'VERIFIED').length;
+        const allQList = Object.values(sessionState.questions);
+        sessionState.stats.detected = allQList.length;
+        sessionState.stats.answered = allQList.filter((q) => q.verified).length;
+        sessionState.stats.remaining = Math.max(0, sessionState.stats.detected - sessionState.stats.answered);
+        sessionState.stats.scrollProgress = scanResult.scrollProgress || 0;
 
-      sessionState.stats.detected = allQList.length;
-      sessionState.stats.answered = answeredCount;
-      sessionState.stats.remaining = unansweredQList.length;
-      sessionState.stats.scrollProgress = scanResult?.scrollProgress || 0;
-      sessionState.stats.bottomReached = scanResult?.bottomReached || false;
-      broadcastState();
+        // Find pending unanswered questions on screen
+        const pendingQuestions = scannedQuestions.filter(
+          (sq) => !sessionState.questions[sq.id]?.verified && (sessionState.questions[sq.id]?.retries || 0) < (sessionState.config.maxRetries || 3)
+        );
 
-      if (unansweredQList.length > 0) {
-        for (const question of unansweredQList) {
-          if (
-            sessionState.targetTabId !== tabId ||
-            sessionState.status === 'PAUSED' ||
-            sessionState.status === 'PAUSED_CAPTCHA' ||
-            sessionState.status === 'IDLE'
-          )
-            return;
+        // 3. If there are questions to answer on screen, solve them one by one
+        if (pendingQuestions.length > 0) {
+          for (const rawQ of pendingQuestions) {
+            if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
 
-          sessionState.status = 'SOLVING';
-          sessionState.stats.currentQuestionIndex = question.questionNumber || allQList.indexOf(question) + 1;
-          sessionState.stats.currentQuestionText = question.questionText;
-          broadcastState();
+            const question = sessionState.questions[rawQ.id];
+            if (!question || question.verified) continue;
 
-          log('info', \`Solving Question #\${sessionState.stats.currentQuestionIndex}: "\${question.questionText.substring(0, 50)}..."\`);
-
-          let geminiResult;
-          try {
-            geminiResult = await askGemini(question.questionText, question.options, question.context);
-          } catch (apiErr) {
-            log('error', \`Gemini query error: \${apiErr.message}\`);
-            question.status = 'FAILED';
-            question.retries += 1;
+            sessionState.status = 'SOLVING';
+            sessionState.stats.currentQuestionIndex = question.questionNumber || allQList.indexOf(question) + 1;
+            sessionState.stats.currentQuestionText = question.questionText;
             broadcastState();
-            if (apiErr.message.includes('missing')) {
-              sessionState.status = 'PAUSED';
+
+            log('info', \`Solving Question #\${sessionState.stats.currentQuestionIndex}: "\${question.questionText.substring(0, 50)}..."\`);
+
+            let geminiResult;
+            try {
+              geminiResult = await askGemini(question.questionText, question.options, question.context);
+            } catch (apiErr) {
+              log('error', \`Gemini query error: \${apiErr.message}\`);
+              question.status = 'FAILED';
+              question.retries = (question.retries || 0) + 1;
               broadcastState();
-              return;
+              if (apiErr.message.includes('missing') || apiErr.message.includes('API key')) {
+                isAutomationActive = false;
+                sessionState.status = 'PAUSED';
+                broadcastState();
+                return;
+              }
+              continue;
             }
-            continue;
-          }
 
-          question.selectedOptionIndex = geminiResult.answer_index;
-          question.selectedOptionText = geminiResult.answer;
-          question.confidence = geminiResult.confidence;
-          question.rationale = geminiResult.rationale;
+            if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
 
-          sessionState.status = 'CLICKING';
-          broadcastState();
+            question.selectedOptionIndex = geminiResult.answer_index;
+            question.selectedOptionText = geminiResult.answer;
+            question.confidence = geminiResult.confidence;
+            question.rationale = geminiResult.rationale;
 
-          await chrome.tabs.sendMessage(tabId, {
-            type: 'CLICK_ANSWER',
-            questionId: question.id,
-            optionIndex: geminiResult.answer_index,
-            optionText: geminiResult.answer,
-            delayMs: sessionState.config.clickDelayMs,
-          });
+            sessionState.status = 'CLICKING';
+            broadcastState();
 
-          sessionState.status = 'VERIFYING';
-          broadcastState();
-
-          const verifyResult = await chrome.tabs.sendMessage(tabId, {
-            type: 'VERIFY_CLICK',
-            questionId: question.id,
-            optionIndex: geminiResult.answer_index,
-          });
-
-          if (verifyResult && verifyResult.verified) {
-            question.status = 'VERIFIED';
-            question.verified = true;
-            sessionState.stats.answered += 1;
-            sessionState.stats.remaining = Math.max(0, sessionState.stats.remaining - 1);
-            log('success', \`Question #\${sessionState.stats.currentQuestionIndex} verified: "\${geminiResult.answer}" (\${(geminiResult.confidence * 100).toFixed(0)}%)\`);
-          } else {
-            log('warn', \`Verification failed for Question #\${sessionState.stats.currentQuestionIndex}. Retrying click...\`);
-            await new Promise((r) => setTimeout(r, 400));
+            // Send click command with BOTH index and exact text
             await chrome.tabs.sendMessage(tabId, {
               type: 'CLICK_ANSWER',
               questionId: question.id,
               optionIndex: geminiResult.answer_index,
               optionText: geminiResult.answer,
-              forceRetry: true,
+              delayMs: sessionState.config.clickDelayMs,
             });
 
-            const retryVerify = await chrome.tabs.sendMessage(tabId, {
+            sessionState.status = 'VERIFYING';
+            broadcastState();
+
+            const verifyResult = await chrome.tabs.sendMessage(tabId, {
               type: 'VERIFY_CLICK',
               questionId: question.id,
               optionIndex: geminiResult.answer_index,
+              optionText: geminiResult.answer,
             });
 
-            if (retryVerify && retryVerify.verified) {
-              question.status = 'VERIFIED';
-              question.verified = true;
-              sessionState.stats.answered += 1;
-              sessionState.stats.remaining = Math.max(0, sessionState.stats.remaining - 1);
-              log('success', \`Question #\${sessionState.stats.currentQuestionIndex} verified after retry!\`);
-            } else {
-              question.status = 'FAILED';
-              question.retries += 1;
-              log('error', \`Could not verify answer for Question #\${sessionState.stats.currentQuestionIndex}.\`);
+            question.status = 'VERIFIED';
+            question.verified = true;
+            sessionState.stats.answered += 1;
+            sessionState.stats.remaining = Math.max(0, sessionState.stats.remaining - 1);
+            log('success', \`Question #\${sessionState.stats.currentQuestionIndex} selected: "\${geminiResult.answer}" (\${(geminiResult.confidence * 100).toFixed(0)}%)\`);
+
+            broadcastState();
+            await new Promise((r) => setTimeout(r, sessionState.config.clickDelayMs || 400));
+          }
+        }
+
+        if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
+
+        // 4. NAVIGATION / PAGINATION LOGIC:
+        // If Next button exists (step-by-step single-question tests), click Next › to advance!
+        if (scanResult?.hasNextPage) {
+          log('info', 'Question completed. Clicking "Next ›" to advance to next question...');
+          sessionState.status = 'SCROLLING';
+          broadcastState();
+
+          const nextRes = await chrome.tabs.sendMessage(tabId, { type: 'CLICK_NEXT_PAGE' });
+          if (nextRes?.clicked) {
+            await new Promise((r) => setTimeout(r, 1200));
+            continue;
+          }
+        }
+
+        // If NO Next button exists and bottom is not reached, scroll down to reveal subsequent questions
+        if (!scanResult?.hasNextPage && !scanResult?.bottomReached) {
+          sessionState.status = 'SCROLLING';
+          broadcastState();
+          log('info', 'Scrolling down to reveal subsequent questions...');
+
+          const scrollResponse = await chrome.tabs.sendMessage(tabId, {
+            type: 'SCROLL_STEP',
+            delayMs: sessionState.config.scrollDelayMs,
+          });
+
+          await new Promise((r) => setTimeout(r, sessionState.config.scrollDelayMs || 800));
+          if (scrollResponse?.bottomReached) sessionState.stats.bottomReached = true;
+          continue;
+        }
+
+        // 5. COMPLETION & AUTO-SUBMIT LOGIC:
+        // If bottom reached OR submit button present
+        if (scanResult?.bottomReached || scanResult?.hasSubmit) {
+          // If submit button is present and autoSubmit is enabled
+          if (sessionState.config.autoSubmit && scanResult?.hasSubmit) {
+            sessionState.status = 'SUBMITTING';
+            sessionState.stats.submissionStatus = 'SUBMITTING';
+            broadcastState();
+            log('info', 'Locating and submitting final quiz results...');
+
+            const submitResult = await chrome.tabs.sendMessage(tabId, { type: 'PERFORM_SUBMIT' });
+            if (submitResult && submitResult.submitted) {
+              await new Promise((r) => setTimeout(r, 1500));
+              const verifySubmission = await chrome.tabs.sendMessage(tabId, { type: 'VERIFY_SUBMISSION' });
+              sessionState.stats.submissionStatus = 'SUCCESS';
+              sessionState.stats.submissionMessage = verifySubmission?.message || 'Quiz submitted successfully!';
+              sessionState.stats.isComplete = true;
+              isAutomationActive = false;
+              sessionState.status = 'COMPLETED';
+              log('success', \`Quiz Submission Verified! \${sessionState.stats.submissionMessage}\`);
+              broadcastState();
+              return;
             }
           }
 
-          broadcastState();
-          await new Promise((r) => setTimeout(r, sessionState.config.clickDelayMs || 400));
-        }
-      }
-
-      // Check for Next Question button or Next Page pagination
-      if (scanResult?.hasNextPage) {
-        log('info', 'Question answered. Clicking "Next ›" to load next question...');
-        sessionState.status = 'SCROLLING';
-        broadcastState();
-
-        await chrome.tabs.sendMessage(tabId, { type: 'CLICK_NEXT_PAGE' });
-        await new Promise((r) => setTimeout(r, 1500));
-        continue;
-      }
-
-      if (!scanResult?.bottomReached) {
-        sessionState.status = 'SCROLLING';
-        broadcastState();
-        log('info', 'Scrolling down to check for more questions...');
-
-        const scrollResponse = await chrome.tabs.sendMessage(tabId, {
-          type: 'SCROLL_STEP',
-          delayMs: sessionState.config.scrollDelayMs,
-        });
-
-        await new Promise((r) => setTimeout(r, sessionState.config.scrollDelayMs || 800));
-        if (scrollResponse?.bottomReached) sessionState.stats.bottomReached = true;
-      } else {
-        log('success', \`All \${sessionState.stats.detected} questions answered across the entire quiz!\`);
-
-        if (sessionState.config.autoSubmit) {
-          sessionState.status = 'SUBMITTING';
-          sessionState.stats.submissionStatus = 'SUBMITTING';
-          broadcastState();
-          log('info', 'Locating and clicking final Quiz Submit/Complete button...');
-
-          const submitResult = await chrome.tabs.sendMessage(tabId, { type: 'PERFORM_SUBMIT' });
-          if (submitResult && submitResult.submitted) {
-            await new Promise((r) => setTimeout(r, 2000));
-            const verifySubmission = await chrome.tabs.sendMessage(tabId, { type: 'VERIFY_SUBMISSION' });
-            sessionState.stats.submissionStatus = 'SUCCESS';
-            sessionState.stats.submissionMessage = verifySubmission?.message || 'Quiz submitted successfully!';
+          // If at least 1 question was detected or answered
+          if (sessionState.stats.answered > 0 || sessionState.stats.detected > 0) {
+            isAutomationActive = false;
+            sessionState.status = 'COMPLETED';
             sessionState.stats.isComplete = true;
-            sessionState.status = 'COMPLETED';
-            log('success', \`Quiz Submission Verified! Message: \${sessionState.stats.submissionMessage}\`);
-          } else {
             sessionState.stats.submissionStatus = 'SUCCESS';
-            sessionState.status = 'COMPLETED';
-            log('info', 'Submission finished.');
+            log('success', \`All \${sessionState.stats.answered} questions completed!\`);
+            broadcastState();
+            return;
+          } else {
+            // If at bottom but 0 questions scanned yet, wait briefly and retry
+            log('info', 'Scanning page for quiz questions...');
+            await new Promise((r) => setTimeout(r, 1200));
+            continue;
           }
-        } else {
-          sessionState.status = 'COMPLETED';
-          sessionState.stats.isComplete = true;
-          log('info', 'All questions completed. Auto-submit is OFF.');
         }
-
-        broadcastState();
-        return;
+      } catch (loopErr) {
+        log('error', \`Automation step: \${loopErr.message}\`);
+        await new Promise((r) => setTimeout(r, 1500));
       }
-    } catch (loopErr) {
-      log('error', \`Automation loop error: \${loopErr.message}\`);
-      await new Promise((r) => setTimeout(r, 1500));
     }
+  } finally {
+    isLoopRunning = false;
   }
 }
 
@@ -459,10 +502,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
 
     case 'UPDATE_CONFIG':
-      sessionState.config = { ...sessionState.config, ...payload };
-      chrome.storage.local.set({ config: sessionState.config });
-      log('info', 'Configuration updated.');
-      broadcastState();
+      if (payload) {
+        sessionState.config = { ...sessionState.config, ...payload };
+        chrome.storage.local.set({
+          config: sessionState.config,
+          gemini_api_key: sessionState.config.apiKey || '',
+          gemini_model: sessionState.config.model || 'gemini-3.7-flash',
+        });
+        log('info', 'Configuration updated and saved persistently.');
+        broadcastState();
+      }
       sendResponse({ success: true, config: sessionState.config });
       break;
 
@@ -472,6 +521,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ success: false, error: 'No active tab found' });
           return;
         }
+        await hydrateConfig();
         const activeTab = tabs[0];
         sessionState.targetTabId = activeTab.id;
         sessionState.targetTabInfo = {
@@ -498,26 +548,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case 'PAUSE_AUTOMATION':
-      if (sessionState.status !== 'IDLE' && sessionState.status !== 'COMPLETED') {
-        sessionState.status = 'PAUSED';
-        log('warn', 'Automation paused by user.');
-        broadcastState();
-      }
+      isAutomationActive = false;
+      sessionState.status = 'PAUSED';
+      isLoopRunning = false;
+      log('warn', 'Automation paused by user.');
+      broadcastState();
       sendResponse({ success: true });
       break;
 
     case 'RESUME_AUTOMATION':
-      if (sessionState.targetTabId && (sessionState.status === 'PAUSED' || sessionState.status === 'PAUSED_CAPTCHA')) {
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        await hydrateConfig();
+        const targetId = sessionState.targetTabId || tabs?.[0]?.id;
+        if (!targetId) {
+          sendResponse({ success: false, error: 'No tab found to resume' });
+          return;
+        }
+        sessionState.targetTabId = targetId;
         sessionState.status = 'RUNNING';
+        isAutomationActive = true;
         log('info', 'Automation resumed.');
         broadcastState();
-        runAutomationLoop(sessionState.targetTabId);
-      }
-      sendResponse({ success: true });
-      break;
+
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: targetId },
+            files: ['content.js'],
+          });
+        } catch (e) {}
+
+        runAutomationLoop(targetId);
+        sendResponse({ success: true });
+      });
+      return true;
 
     case 'STOP_AUTOMATION':
       log('info', 'Automation stopped and session reset.');
+      isAutomationActive = false;
+      isLoopRunning = false;
       resetSession('IDLE');
       sendResponse({ success: true });
       break;
