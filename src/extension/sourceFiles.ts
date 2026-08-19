@@ -14,8 +14,7 @@ export const EXTENSION_FILES: Record<string, string> = {
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "service_worker": "background.js"
   },
   "action": {
     "default_popup": "popup.html",

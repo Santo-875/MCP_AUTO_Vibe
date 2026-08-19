@@ -80,9 +80,12 @@ export const InstallationGuide: React.FC = () => {
           </div>
           <h3 className="text-base font-bold text-slate-900 mb-2">Click "Load Unpacked"</h3>
           <p className="text-xs text-slate-500 leading-relaxed">
-            Click the <strong className="text-slate-900">"Load unpacked"</strong> button in the top-left toolbar and select your extracted folder containing <code className="bg-slate-200/80 px-2 py-0.5 rounded text-indigo-700 font-mono font-bold">manifest.json</code>.
+            Click the <strong className="text-slate-900">"Load unpacked"</strong> button in the top-left toolbar and select your extracted folder that directly contains <code className="bg-slate-200/80 px-2 py-0.5 rounded text-indigo-700 font-mono font-bold">manifest.json</code>.
           </p>
-          <div className="mt-5 p-3.5 bg-white border border-slate-200 rounded-xl flex items-center gap-2.5 text-xs text-emerald-700 font-semibold shadow-xs">
+          <div className="mt-3 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-800 leading-snug">
+            ⚠️ <strong>Fix "Manifest missing" error:</strong> Ensure you select the folder containing <code className="font-bold">manifest.json</code>, not the raw <code className="font-bold">.zip</code> file or a parent downloads directory.
+          </div>
+          <div className="mt-3 p-3 bg-white border border-slate-200 rounded-xl flex items-center gap-2.5 text-xs text-emerald-700 font-semibold shadow-xs">
             <FolderCheck size={18} className="shrink-0 text-emerald-600" />
             <span>The Gemini MCQ Solver card and icon will instantly appear!</span>
           </div>
