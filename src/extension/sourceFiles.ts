@@ -333,12 +333,19 @@ async function runAutomationLoop(tabId) {
         sessionState.stats.remaining = Math.max(0, sessionState.stats.detected - sessionState.stats.answered);
         sessionState.stats.scrollProgress = scanResult.scrollProgress || 0;
 
-        // Find pending unanswered questions on screen
+        // If no questions detected on this scan, wait and retry scanning (NEVER click Next on empty scans)
+        if (scannedQuestions.length === 0) {
+          log('info', 'Scanning page for quiz questions and options...');
+          await new Promise((r) => setTimeout(r, 1200));
+          continue;
+        }
+
+        // Find pending unanswered questions on the current screen/page
         const pendingQuestions = scannedQuestions.filter(
           (sq) => !sessionState.questions[sq.id]?.verified && (sessionState.questions[sq.id]?.retries || 0) < (sessionState.config.maxRetries || 3)
         );
 
-        // 3. If there are questions to answer on screen, solve them one by one
+        // 3. Solve EVERY pending question on the screen first
         if (pendingQuestions.length > 0) {
           for (const rawQ of pendingQuestions) {
             if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
@@ -351,13 +358,13 @@ async function runAutomationLoop(tabId) {
             sessionState.stats.currentQuestionText = question.questionText;
             broadcastState();
 
-            log('info', \`Solving Question #\${sessionState.stats.currentQuestionIndex}: "\${question.questionText.substring(0, 50)}..."\`);
+            log('info', \`[Question #\${sessionState.stats.currentQuestionIndex}] Consulting Gemini AI: "\${question.questionText.substring(0, 55)}..."\`);
 
             let geminiResult;
             try {
               geminiResult = await askGemini(question.questionText, question.options, question.context);
             } catch (apiErr) {
-              log('error', \`Gemini query error: \${apiErr.message}\`);
+              log('error', \`Gemini API query error: \${apiErr.message}\`);
               question.status = 'FAILED';
               question.retries = (question.retries || 0) + 1;
               broadcastState();
@@ -381,7 +388,7 @@ async function runAutomationLoop(tabId) {
             broadcastState();
 
             // Send click command with BOTH index and exact text
-            await chrome.tabs.sendMessage(tabId, {
+            const clickRes = await chrome.tabs.sendMessage(tabId, {
               type: 'CLICK_ANSWER',
               questionId: question.id,
               optionIndex: geminiResult.answer_index,
@@ -392,7 +399,7 @@ async function runAutomationLoop(tabId) {
             sessionState.status = 'VERIFYING';
             broadcastState();
 
-            const verifyResult = await chrome.tabs.sendMessage(tabId, {
+            await chrome.tabs.sendMessage(tabId, {
               type: 'VERIFY_CLICK',
               questionId: question.id,
               optionIndex: geminiResult.answer_index,
@@ -403,25 +410,36 @@ async function runAutomationLoop(tabId) {
             question.verified = true;
             sessionState.stats.answered += 1;
             sessionState.stats.remaining = Math.max(0, sessionState.stats.remaining - 1);
-            log('success', \`Question #\${sessionState.stats.currentQuestionIndex} selected: "\${geminiResult.answer}" (\${(geminiResult.confidence * 100).toFixed(0)}%)\`);
+            log('success', \`✔ [Question #\${sessionState.stats.currentQuestionIndex}] Answer Selected: "\${geminiResult.answer}" (\${(geminiResult.confidence * 100).toFixed(0)}% confidence)\`);
 
             broadcastState();
-            await new Promise((r) => setTimeout(r, sessionState.config.clickDelayMs || 400));
+            await new Promise((r) => setTimeout(r, sessionState.config.clickDelayMs || 500));
           }
         }
 
         if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
 
+        // Verify if ALL scanned questions on this page are now answered before allowing any movement
+        const allPageQuestionsAnswered = scannedQuestions.every(
+          (sq) => sq.isAnswered || sessionState.questions[sq.id]?.verified
+        );
+
+        if (!allPageQuestionsAnswered) {
+          log('info', 'Awaiting full question completion on current page before advancing...');
+          await new Promise((r) => setTimeout(r, 800));
+          continue;
+        }
+
         // 4. NAVIGATION / PAGINATION LOGIC:
-        // If Next button exists (step-by-step single-question tests), click Next › to advance!
+        // Only click Next › when all questions on this page have been answered!
         if (scanResult?.hasNextPage) {
-          log('info', 'Question completed. Clicking "Next ›" to advance to next question...');
+          log('info', 'All questions on current page answered. Clicking "Next ›" to advance...');
           sessionState.status = 'SCROLLING';
           broadcastState();
 
           const nextRes = await chrome.tabs.sendMessage(tabId, { type: 'CLICK_NEXT_PAGE' });
           if (nextRes?.clicked) {
-            await new Promise((r) => setTimeout(r, 1200));
+            await new Promise((r) => setTimeout(r, 1500));
             continue;
           }
         }
@@ -430,7 +448,7 @@ async function runAutomationLoop(tabId) {
         if (!scanResult?.hasNextPage && !scanResult?.bottomReached) {
           sessionState.status = 'SCROLLING';
           broadcastState();
-          log('info', 'Scrolling down to reveal subsequent questions...');
+          log('info', 'Visible questions answered. Scrolling down to reveal more...');
 
           const scrollResponse = await chrome.tabs.sendMessage(tabId, {
             type: 'SCROLL_STEP',
@@ -450,34 +468,33 @@ async function runAutomationLoop(tabId) {
             sessionState.status = 'SUBMITTING';
             sessionState.stats.submissionStatus = 'SUBMITTING';
             broadcastState();
-            log('info', 'Locating and submitting final quiz results...');
+            log('info', 'All questions answered! Locating and submitting final quiz results...');
 
             const submitResult = await chrome.tabs.sendMessage(tabId, { type: 'PERFORM_SUBMIT' });
             if (submitResult && submitResult.submitted) {
-              await new Promise((r) => setTimeout(r, 1500));
+              await new Promise((r) => setTimeout(r, 1600));
               const verifySubmission = await chrome.tabs.sendMessage(tabId, { type: 'VERIFY_SUBMISSION' });
               sessionState.stats.submissionStatus = 'SUCCESS';
               sessionState.stats.submissionMessage = verifySubmission?.message || 'Quiz submitted successfully!';
               sessionState.stats.isComplete = true;
               isAutomationActive = false;
               sessionState.status = 'COMPLETED';
-              log('success', \`Quiz Submission Verified! \${sessionState.stats.submissionMessage}\`);
+              log('success', \`Quiz Submission Complete! \${sessionState.stats.submissionMessage}\`);
               broadcastState();
               return;
             }
           }
 
-          // If at least 1 question was detected or answered
-          if (sessionState.stats.answered > 0 || sessionState.stats.detected > 0) {
+          // If at least 1 question was detected and answered
+          if (sessionState.stats.answered > 0) {
             isAutomationActive = false;
             sessionState.status = 'COMPLETED';
             sessionState.stats.isComplete = true;
             sessionState.stats.submissionStatus = 'SUCCESS';
-            log('success', \`All \${sessionState.stats.answered} questions completed!\`);
+            log('success', \`All \${sessionState.stats.answered} quiz questions completed successfully!\`);
             broadcastState();
             return;
           } else {
-            // If at bottom but 0 questions scanned yet, wait briefly and retry
             log('info', 'Scanning page for quiz questions...');
             await new Promise((r) => setTimeout(r, 1200));
             continue;
@@ -1240,8 +1257,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       case 'SCAN_PAGE': {
-        const containers = findQuestionElements();
-        const questions = containers.map((c, idx) => {
+        let containers = findQuestionElements();
+        let questions = containers.map((c, idx) => {
           const parsed = parseQuestion(c, idx);
           return {
             id: parsed.id,
@@ -1251,6 +1268,73 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             isAnswered: parsed.isAnswered,
           };
         });
+
+        // Filter out empty invalid questions
+        questions = questions.filter((q) => q.questionText && q.options && q.options.length >= 2);
+
+        // Fallback: If no structured question was found, extract the prominent page question and options!
+        if (questions.length === 0) {
+          const visibleChoices = Array.from(
+            document.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .quiz-option, button:not([data-action="next"]):not([data-action="prev"]):not([type="submit"])')
+          ).filter((el) => isVisibleElement(el) && !isNavigationText(el.textContent));
+
+          // Leaf choices
+          const leafChoices = visibleChoices.filter((item) => !visibleChoices.some((other) => other !== item && item.contains(other)));
+
+          if (leafChoices.length >= 2) {
+            // Find most prominent heading or text stem on the page
+            const candidateHeadings = Array.from(document.querySelectorAll('h1, h2, h3, h4, [role="heading"], legend, strong, p.question, .title, .prompt')).filter(isVisibleElement);
+            let fallbackStem = '';
+            for (const h of candidateHeadings) {
+              const txt = cleanText(h.textContent);
+              if (txt.length > 5 && !isNavigationText(txt)) {
+                fallbackStem = txt;
+                break;
+              }
+            }
+            if (!fallbackStem) {
+              fallbackStem = cleanText(document.body.innerText).substring(0, 180);
+            }
+
+            const fallbackOpts = [];
+            const fallbackElements = [];
+            const seen = new Set();
+            let isAns = false;
+
+            leafChoices.slice(0, 8).forEach((el) => {
+              let optTxt = cleanText(el.textContent || el.value || '');
+              optTxt = optTxt.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
+              if (optTxt && !isNavigationText(optTxt) && !seen.has(optTxt.toLowerCase())) {
+                seen.add(optTxt.toLowerCase());
+                const optIdx = fallbackOpts.length;
+                el.setAttribute('data-gemini-opt-idx', String(optIdx));
+                fallbackOpts.push(optTxt);
+                fallbackElements.push(el);
+                if (el.querySelector?.('input:checked') || el.classList.contains('selected') || el.getAttribute('aria-checked') === 'true') {
+                  isAns = true;
+                }
+              }
+            });
+
+            if (fallbackOpts.length >= 2) {
+              const qId = hashString(fallbackStem + '_page');
+              activeQuestionMap.set(qId, {
+                container: document.body,
+                questionText: fallbackStem,
+                options: fallbackOpts,
+                optionElements: fallbackElements,
+                isAnswered: isAns,
+              });
+              questions.push({
+                id: qId,
+                questionNumber: 1,
+                questionText: fallbackStem,
+                options: fallbackOpts,
+                isAnswered: isAns,
+              });
+            }
+          }
+        }
 
         const hasNextPage = !!findNextButton();
         const hasSubmit = !!findSubmitButton();
@@ -1283,7 +1367,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             const targetClean = cleanText(optionText).toLowerCase();
             const foundIdx = cached.options.findIndex((opt) => {
               const optClean = cleanText(opt).toLowerCase();
-              return optClean.includes(targetClean) || targetClean.includes(optClean);
+              return optClean === targetClean || optClean.includes(targetClean) || targetClean.includes(optClean);
             });
             if (foundIdx !== -1 && cached.optionElements[foundIdx]) {
               targetOption = cached.optionElements[foundIdx];
@@ -1303,29 +1387,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           targetOption = container.querySelector(\`[data-gemini-opt-idx="\${optionIndex}"]\`);
         }
 
-        // 4. Find by direct option element matching
+        // 4. Find inside container by optionText or optionIndex
         if (!targetOption) {
           const rawOptions = Array.from(
             container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .quiz-option, .test-option, li, button:not([type="submit"]):not([data-action="next"]):not([data-action="prev"])')
           ).filter((el) => isVisibleElement(el) && !isNavigationText(el.textContent));
 
-          // Filter out parents containing other options
           const leafOptions = rawOptions.filter((item) => !rawOptions.some((other) => other !== item && item.contains(other)));
 
           if (optionText && leafOptions.length > 0) {
             const targetClean = cleanText(optionText).toLowerCase();
             targetOption = leafOptions.find((opt) => {
               const optClean = cleanText(opt.textContent).toLowerCase();
-              return optClean.includes(targetClean) || targetClean.includes(optClean);
+              return optClean === targetClean || optClean.includes(targetClean) || targetClean.includes(optClean);
             });
           }
 
           if (!targetOption && optionIndex !== undefined && leafOptions[optionIndex]) {
             targetOption = leafOptions[optionIndex];
           }
+        }
 
-          if (!targetOption && leafOptions.length > 0) {
-            targetOption = leafOptions[0];
+        // 5. Document-wide fallback search by optionText
+        if (!targetOption && optionText) {
+          const targetClean = cleanText(optionText).toLowerCase();
+          const allCandidates = Array.from(
+            document.querySelectorAll('label, button, [role="radio"], [role="option"], .choice, .option, .answer, li, p, span, div')
+          ).filter((el) => isVisibleElement(el) && !isNavigationText(el.textContent));
+
+          // Prefer smaller leaf elements
+          targetOption = allCandidates.find((el) => {
+            const t = cleanText(el.textContent).toLowerCase();
+            return (t === targetClean || (t.includes(targetClean) && t.length < targetClean.length + 30)) && el.children.length <= 2;
+          });
+        }
+
+        // 6. Final fallback: Any option at optionIndex on the entire screen
+        if (!targetOption && optionIndex !== undefined) {
+          const allOptionsOnPage = Array.from(
+            document.querySelectorAll('[data-gemini-opt-idx], input[type="radio"], input[type="checkbox"], [role="radio"]')
+          ).filter(isVisibleElement);
+          if (allOptionsOnPage[optionIndex]) {
+            targetOption = allOptionsOnPage[optionIndex];
           }
         }
 
@@ -1335,7 +1438,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         simulateUserClick(targetOption);
-        sendResponse({ success: true });
+        sendResponse({ success: true, clickedText: optionText });
         break;
       }
 
