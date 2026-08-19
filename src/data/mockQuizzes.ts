@@ -1,0 +1,291 @@
+export interface MockQuestionItem {
+  id: string;
+  questionNumber: number;
+  question: string;
+  options: string[];
+  correctIndex: number;
+  explanation: string;
+  category: string;
+  difficulty: 'Easy' | 'Medium' | 'Hard';
+  lazyLoadGroup?: number; // 0 = initial, 1 = loads on scroll 1, 2 = loads on scroll 2
+}
+
+export interface MockQuizDefinition {
+  id: string;
+  title: string;
+  description: string;
+  quizType: 'lms' | 'lazy' | 'react' | 'forms' | 'captcha';
+  badge: string;
+  questions: MockQuestionItem[];
+  hasCaptcha?: boolean;
+}
+
+export const MOCK_QUIZZES: MockQuizDefinition[] = [
+  {
+    id: 'lms_canvas_exam',
+    title: 'University LMS Final Exam (Canvas/Moodle Layout)',
+    description: 'Realistic LMS interface using custom card components, role="radio", active state classes, and a final submit modal.',
+    quizType: 'lms',
+    badge: 'LMS Quiz',
+    questions: [
+      {
+        id: 'lms_q1',
+        questionNumber: 1,
+        question: 'What is the primary function of ribosomes in cellular biology?',
+        options: [
+          'Synthesizing adenosine triphosphate (ATP)',
+          'Translating mRNA into polypeptide protein chains',
+          'Packaging lipids into secretory vesicles',
+          'Breaking down cellular waste through acidic hydrolytic enzymes',
+        ],
+        correctIndex: 1,
+        explanation: 'Ribosomes are the cellular machinery responsible for translating messenger RNA into protein chains.',
+        category: 'Cell Biology',
+        difficulty: 'Medium',
+      },
+      {
+        id: 'lms_q2',
+        questionNumber: 2,
+        question: 'In computer science, what is the worst-case time complexity of QuickSort when a poor pivot strategy is selected?',
+        options: ['O(n log n)', 'O(n)', 'O(n²)', 'O(log n)'],
+        correctIndex: 2,
+        explanation: 'QuickSort degrades to O(n²) worst-case when the pivot repeatedly divides the array into subproblems of size 0 and n-1.',
+        category: 'Algorithms',
+        difficulty: 'Medium',
+      },
+      {
+        id: 'lms_q3',
+        questionNumber: 3,
+        question: 'Which economic indicator measures the total market value of all final goods and services produced within a nation in a given year?',
+        options: [
+          'Consumer Price Index (CPI)',
+          'Gross Domestic Product (GDP)',
+          'Purchasing Power Parity (PPP)',
+          'Net International Investment Position',
+        ],
+        correctIndex: 1,
+        explanation: 'Gross Domestic Product (GDP) represents the aggregate monetary market value of all final products inside a country.',
+        category: 'Macroeconomics',
+        difficulty: 'Easy',
+      },
+      {
+        id: 'lms_q4',
+        questionNumber: 4,
+        question: 'Which of the following sorting algorithms is guaranteed to be stable and has an O(n log n) worst-case time complexity?',
+        options: ['HeapSort', 'MergeSort', 'SelectionSort', 'Standard QuickSort'],
+        correctIndex: 1,
+        explanation: 'MergeSort is a stable divide-and-conquer algorithm with consistent O(n log n) performance across all cases.',
+        category: 'Data Structures',
+        difficulty: 'Medium',
+      },
+      {
+        id: 'lms_q5',
+        questionNumber: 5,
+        question: 'What is the SI unit of electric capacitance?',
+        options: ['Henry', 'Farad', 'Tesla', 'Weber'],
+        correctIndex: 1,
+        explanation: 'The Farad (symbol: F) is the SI derived unit of electrical capacitance.',
+        category: 'Physics',
+        difficulty: 'Easy',
+      },
+    ],
+  },
+  {
+    id: 'lazy_infinite_quiz',
+    title: 'Dynamic Lazy-Loaded / Infinite Scroll Assessment',
+    description: 'Questions 4 to 8 are dynamically inserted into the DOM only when the agent scrolls down the page.',
+    quizType: 'lazy',
+    badge: 'Dynamic Scroll',
+    questions: [
+      {
+        id: 'lazy_q1',
+        questionNumber: 1,
+        question: 'What is the capital city of Australia?',
+        options: ['Sydney', 'Melbourne', 'Canberra', 'Brisbane'],
+        correctIndex: 2,
+        explanation: 'Canberra is the federal capital of Australia, selected in 1908 as a compromise between Sydney and Melbourne.',
+        category: 'Geography',
+        difficulty: 'Easy',
+        lazyLoadGroup: 0,
+      },
+      {
+        id: 'lazy_q2',
+        questionNumber: 2,
+        question: 'Which planet in our solar system has the highest density?',
+        options: ['Jupiter', 'Earth', 'Mercury', 'Venus'],
+        correctIndex: 1,
+        explanation: 'Earth is the densest planet in the Solar System, with an average density of roughly 5.51 g/cm³.',
+        category: 'Astronomy',
+        difficulty: 'Medium',
+        lazyLoadGroup: 0,
+      },
+      {
+        id: 'lazy_q3',
+        questionNumber: 3,
+        question: 'Which data format is native to JavaScript and universally used for lightweight API serialization?',
+        options: ['XML', 'YAML', 'JSON', 'Protocol Buffers'],
+        correctIndex: 2,
+        explanation: 'JSON (JavaScript Object Notation) is a lightweight, human-readable standard data interchange format.',
+        category: 'Web Tech',
+        difficulty: 'Easy',
+        lazyLoadGroup: 0,
+      },
+      {
+        id: 'lazy_q4',
+        questionNumber: 4,
+        question: 'What chemical element has the atomic number 79 and symbol Au?',
+        options: ['Silver', 'Gold', 'Platinum', 'Copper'],
+        correctIndex: 1,
+        explanation: 'Gold has the atomic number 79 and chemical symbol Au (from Latin aurum).',
+        category: 'Chemistry',
+        difficulty: 'Easy',
+        lazyLoadGroup: 1,
+      },
+      {
+        id: 'lazy_q5',
+        questionNumber: 5,
+        question: 'In React, which hook is used to perform side effects such as fetching data or subscribing to events?',
+        options: ['useState', 'useEffect', 'useMemo', 'useRef'],
+        correctIndex: 1,
+        explanation: 'useEffect is designed specifically for orchestrating lifecycle side effects in functional React components.',
+        category: 'Frontend',
+        difficulty: 'Easy',
+        lazyLoadGroup: 1,
+      },
+      {
+        id: 'lazy_q6',
+        questionNumber: 6,
+        question: 'Who developed the General Theory of Relativity published in 1915?',
+        options: ['Isaac Newton', 'Albert Einstein', 'Niels Bohr', 'Max Planck'],
+        correctIndex: 1,
+        explanation: 'Albert Einstein published his revolutionary General Theory of Relativity in late 1915.',
+        category: 'Physics',
+        difficulty: 'Easy',
+        lazyLoadGroup: 2,
+      },
+    ],
+  },
+  {
+    id: 'modern_react_quiz',
+    title: 'Modern SPA Component Quiz (Custom Clickable DIVs & Cards)',
+    description: 'Uses no native radio buttons. Built entirely with custom React state, styled buttons, role="option", and keyboard navigators.',
+    quizType: 'react',
+    badge: 'SPA React',
+    questions: [
+      {
+        id: 'react_q1',
+        questionNumber: 1,
+        question: 'What is the main advantage of HTTP/2 over HTTP/1.1?',
+        options: [
+          'Multiplexed asynchronous streams over a single TCP connection',
+          'Elimination of TCP handshakes completely',
+          'Default end-to-end symmetric quantum encryption',
+          'Removal of all request headers',
+        ],
+        correctIndex: 0,
+        explanation: 'HTTP/2 introduces binary framing and multiplexing to avoid head-of-line blocking on single connections.',
+        category: 'Networking',
+        difficulty: 'Hard',
+      },
+      {
+        id: 'react_q2',
+        questionNumber: 2,
+        question: 'Which CSS property allows modern browsers to specify responsive intrinsic layout without media queries?',
+        options: ['grid-template-columns: repeat(auto-fit, minmax(...))', 'display: inline-block', 'float: left', 'position: relative'],
+        correctIndex: 0,
+        explanation: 'CSS Grid repeat(auto-fit, minmax()) allows fluid card columns that wrap automatically according to space.',
+        category: 'CSS',
+        difficulty: 'Medium',
+      },
+      {
+        id: 'react_q3',
+        questionNumber: 3,
+        question: 'Which of the following is a non-relational document database?',
+        options: ['PostgreSQL', 'MongoDB', 'Oracle Database', 'SQLite'],
+        correctIndex: 1,
+        explanation: 'MongoDB stores data in flexible BSON (JSON-like) documents rather than relational tables.',
+        category: 'Databases',
+        difficulty: 'Easy',
+      },
+    ],
+  },
+  {
+    id: 'google_forms_quiz',
+    title: 'Classic Form Assessment (Google Forms / HTML5 Fieldsets)',
+    description: 'Semantic fieldset, legend, native input[type="radio"], labels with for="" bindings, and submit inputs.',
+    quizType: 'forms',
+    badge: 'Form Fieldsets',
+    questions: [
+      {
+        id: 'forms_q1',
+        questionNumber: 1,
+        question: 'Which gas makes up approximately 78% of Earth’s atmosphere by volume?',
+        options: ['Oxygen', 'Nitrogen', 'Argon', 'Carbon Dioxide'],
+        correctIndex: 1,
+        explanation: 'Nitrogen gas (N2) comprises approximately 78.08% of Earth’s dry atmosphere.',
+        category: 'Earth Science',
+        difficulty: 'Easy',
+      },
+      {
+        id: 'forms_q2',
+        questionNumber: 2,
+        question: 'What is the term for a software vulnerability where memory bounds are exceeded, leading to code injection or crashes?',
+        options: ['SQL Injection', 'Cross-Site Scripting (XSS)', 'Buffer Overflow', 'Man-In-The-Middle (MITM)'],
+        correctIndex: 2,
+        explanation: 'A Buffer Overflow occurs when a program writes more data to a buffer than its allocated capacity.',
+        category: 'Security',
+        difficulty: 'Medium',
+      },
+      {
+        id: 'forms_q3',
+        questionNumber: 3,
+        question: 'Which treaty established the European Union in 1993?',
+        options: ['Treaty of Versailles', 'Maastricht Treaty', 'Treaty of Rome', 'Schengen Agreement'],
+        correctIndex: 1,
+        explanation: 'The Maastricht Treaty, signed in 1992 and in effect in 1993, formally created the European Union.',
+        category: 'History',
+        difficulty: 'Medium',
+      },
+    ],
+  },
+  {
+    id: 'captcha_security_quiz',
+    title: 'Security Challenge Quiz with Cloudflare / reCAPTCHA Pause Flow',
+    description: 'Demonstrates the extension detecting an anti-bot challenge, pausing immediately, alerting the user, and resuming smoothly.',
+    quizType: 'captcha',
+    badge: 'CAPTCHA Pause Demo',
+    hasCaptcha: true,
+    questions: [
+      {
+        id: 'cap_q1',
+        questionNumber: 1,
+        question: 'What does the acronym DNS stand for in computer networks?',
+        options: ['Domain Name System', 'Digital Network Standard', 'Dynamic Node Service', 'Data Navigation Server'],
+        correctIndex: 0,
+        explanation: 'DNS stands for Domain Name System, the phonebook of the internet.',
+        category: 'Networking',
+        difficulty: 'Easy',
+      },
+      {
+        id: 'cap_q2',
+        questionNumber: 2,
+        question: 'Which cryptographic algorithm is widely used for asymmetric public-key cryptography?',
+        options: ['AES-256', 'RSA', 'SHA-256', 'Blowfish'],
+        correctIndex: 1,
+        explanation: 'RSA (Rivest–Shamir–Adleman) is a widely deployed asymmetric public-key cryptosystem.',
+        category: 'Cryptography',
+        difficulty: 'Medium',
+      },
+      {
+        id: 'cap_q3',
+        questionNumber: 3,
+        question: 'What is the speed of light in a vacuum to the nearest whole million meters per second?',
+        options: ['300,000,000 m/s', '150,000,000 m/s', '1,080,000,000 m/s', '30,000 m/s'],
+        correctIndex: 0,
+        explanation: 'The speed of light in vacuum is exactly 299,792,458 m/s, approximately 300,000,000 m/s.',
+        category: 'Physics',
+        difficulty: 'Easy',
+      },
+    ],
+  },
+];
