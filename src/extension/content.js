@@ -1,511 +1,1146 @@
 /**
- * Gemini Auto MCQ & Quiz Solver - In-Page Content Script
- * Autonomous DOM detection, real simulated clicking, multi-signal verification,
- * dynamic scrolling, CAPTCHA pausing, submit detection, and floating HUD overlay.
+ * Gemini Auto MCQ & Quiz Solver - Content Script Agent
+ * Autonomous DOM detection, robust multi-type answer filling (Radio, Checkbox, Dropdown, Text Input),
+ * Next/Page navigation engine, and auto-submission handling.
  */
 
-(function () {
-  // Prevent duplicate script execution
-  if (window.__GEMINI_MCQ_SOLVER_INITIALIZED__) return;
-  window.__GEMINI_MCQ_SOLVER_INITIALIZED__ = true;
+(() => {
+  if (window.__GEMINI_MCQ_SOLVER_LOADED__) return;
+  window.__GEMINI_MCQ_SOLVER_LOADED__ = true;
 
-  console.log('%c[Gemini MCQ Solver]%c Autonomous In-Page Agent Loaded.', 'background: #2563eb; color: #fff; padding: 2px 6px; border-radius: 4px;', '');
+  const SCAN_SELECTORS = {
+    questionContainers: [
+      'fieldset',
+      '[role="radiogroup"]',
+      '[role="group"]',
+      '.question',
+      '.quiz-question',
+      '.mcq-item',
+      '.form-group',
+      '.freebirdFormviewerViewNumberedItemContainer',
+      '.gefs-field-container',
+      '.moodle-question',
+      '.que',
+      '.wpProQuiz_listItem',
+      '.quiz-card',
+      '.question-container',
+      '.test-question',
+      '.exam-question',
+      '.card:has(input[type="radio"])',
+      '.card:has(input[type="checkbox"])',
+      '.card:has(select)',
+      '[data-question-id]',
+      '[id*="question"]',
+      '[class*="question"]',
+      'div:has(input[type="radio"])',
+      'div:has(input[type="checkbox"])',
+      'div:has(select)',
+      'div:has(textarea)',
+      'div:has([role="radio"])',
+      'div:has([role="option"])',
+      'li:has(input[type="radio"])',
+      'section:has(input[type="radio"])',
+    ],
+    nextButtons: [
+      'button[data-action="next"]',
+      'button.next-btn',
+      'button.next-button',
+      'button.btn-next',
+      '.next-page-btn',
+      '.pagination-next',
+      'a.next',
+      'input[name="next"]',
+      'input[value*="Next" i]',
+      'input[value*="Continue" i]',
+      'input[value*="Save & Next" i]',
+      'div[role="button"][jsname="OCpkoe"]',
+      'div[role="button"].N2B65e',
+      '.freebirdFormviewerViewNavigationNextButton',
+      'button[id*="next"]',
+      'a[id*="next"]',
+      'button[class*="next"]',
+      'a[class*="next"]',
+      '.mod_quiz-next-nav',
+      '#question-next-btn',
+      '.btn-next-question',
+    ],
+    submitButtons: [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button.submit-btn',
+      'button.btn-submit',
+      '.quiz-submit',
+      '[data-action="submit"]',
+      '#submit-quiz',
+      '#quiz-submit-button',
+      'input[value*="Submit" i]',
+      'input[value*="Finish" i]',
+      'input[value*="Complete" i]',
+      'div[role="button"][jsname="M2v1dh"]',
+      '.freebirdFormviewerViewNavigationSubmitButton',
+      'button[id*="submit"]',
+      'button[class*="submit"]',
+    ],
+    captcha: [
+      '#cf-challenge-running',
+      '#challenge-running',
+    ],
+  };
 
-  // In-memory DOM cache
-  const domQuestionCache = new Map(); // questionId -> { element, options: [{ element, text }] }
-  let floatingHudElement = null;
+  let overlayHudElement = null;
 
-  // 1. Unique Question Hashing Function
-  function generateQuestionId(text, options) {
-    const raw = (text || '').trim().toLowerCase().replace(/\s+/g, ' ') + '::' +
-      (options || []).map((o) => (o || '').trim().toLowerCase().replace(/\s+/g, ' ')).join('|');
+  function createOrUpdateHud(stats, status, currentQuestion) {
+    if (!overlayHudElement) {
+      overlayHudElement = document.createElement('div');
+      overlayHudElement.id = 'gemini-mcq-solver-hud';
+      overlayHudElement.style.cssText = `
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        z-index: 2147483647;
+        background: #0f172a;
+        color: #ffffff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 12px;
+        padding: 14px 16px;
+        border-radius: 14px;
+        box-shadow: 0 12px 35px -5px rgba(0,0,0,0.6), 0 0 0 1px #6366f1;
+        border: 1.5px solid #6366f1;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        min-width: 260px;
+        max-width: 360px;
+        max-height: 80vh;
+        overflow-y: auto;
+        pointer-events: auto;
+        user-select: none;
+        transition: all 0.3s ease;
+      `;
+      document.body.appendChild(overlayHudElement);
+    }
+
+    const qIdx = currentQuestion?.index || stats?.currentQuestionIndex || 0;
+    const qNum = qIdx ? `Q#${qIdx}` : '';
+    const answerText = currentQuestion?.answer || stats?.currentAnswerText || '';
+    const confVal = currentQuestion?.confidence || stats?.currentConfidence;
+    const confidencePct = confVal ? `${Math.round(confVal * 100)}%` : '';
+    const options = currentQuestion?.options || [];
+    const answerIdx = currentQuestion?.answerIndex;
+
+    // Build options list HTML
+    let optionsHtml = '';
+    if (options.length > 0) {
+      optionsHtml = `
+        <div style="background: #0c1a2e; border: 1px solid #334155; border-radius: 8px; padding: 8px 10px;">
+          <div style="font-size: 10px; font-weight: 700; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px;">Options</div>
+          ${options.map((opt, i) => {
+            const isCorrect = (answerText && (cleanText(opt).toLowerCase() === cleanText(answerText).toLowerCase() || cleanText(answerText).toLowerCase().includes(cleanText(opt).toLowerCase()))) || (typeof answerIdx === 'number' && answerIdx === i);
+            return `<div style="display:flex; align-items:flex-start; gap:6px; padding:3px 0; border-bottom: 1px solid #1e293b;">
+              <span style="min-width:18px; font-size:11px; font-weight:700; color:${isCorrect ? '#34d399' : '#64748b'};">${String.fromCharCode(65 + i)}.</span>
+              <span style="font-size:12px; word-break:break-word; color:${isCorrect ? '#86efac' : '#cbd5e1'}; font-weight:${isCorrect ? '700' : '400'};">
+                ${isCorrect ? '✔ ' : ''}${escapeHtml(opt)}
+              </span>
+            </div>`;
+          }).join('')}
+        </div>
+      `;
+    }
+
+    overlayHudElement.innerHTML = `
+      <div style="display:flex; align-items:center; justify-content:space-between; width:100%; gap:10px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <div style="width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;"></div>
+          <span style="font-weight:800;font-size:11px;color:#a5b4fc;text-transform:uppercase;letter-spacing:0.6px;">Gemini AI Solver</span>
+        </div>
+        <span style="font-size:11px;font-weight:700;background:#312e81;color:#c7d2fe;padding:2px 8px;border-radius:9999px;border:1px solid #4338ca;">
+          ${stats?.answered || 0}/${stats?.detected || 0} Done
+        </span>
+      </div>
+
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+        <div style="font-size:13px;font-weight:700;color:#38bdf8;">${qNum ? `${qNum} — ` : ''}${status || 'Active'}</div>
+        ${confidencePct ? `<div style="font-size:10px;font-weight:700;color:#34d399;background:#064e3b;padding:2px 6px;border-radius:4px;">${confidencePct}</div>` : ''}
+      </div>
+
+      ${optionsHtml}
+
+      ${answerText && options.length === 0 ? `
+        <div style="background:#1e1b4b;border:1px solid #4f46e5;border-radius:8px;padding:8px 10px;">
+          <div style="font-size:10px;font-weight:700;color:#a5b4fc;text-transform:uppercase;margin-bottom:2px;">Correct Answer</div>
+          <div style="font-size:13px;font-weight:700;color:#34d399;word-break:break-word;">✔ &quot;${escapeHtml(answerText)}&quot;</div>
+        </div>
+      ` : ''}
+    `;
+  }
+
+  function removeHud() {
+    if (overlayHudElement) {
+      overlayHudElement.remove();
+      overlayHudElement = null;
+    }
+  }
+
+  function checkForCaptcha() {
+    const blockingSelectors = [
+      '#cf-challenge-running',
+      '#challenge-running',
+    ];
+    for (const selector of blockingSelectors) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && el.offsetWidth > 100 && el.offsetHeight > 50) {
+          return {
+            captchaDetected: true,
+            captchaType: 'Cloudflare Challenge',
+          };
+        }
+      } catch (e) {}
+    }
+    return { captchaDetected: false };
+  }
+
+  function hashString(str) {
     let hash = 0;
-    for (let i = 0; i < raw.length; i++) {
-      const char = raw.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
-      hash |= 0; // Convert to 32bit integer
+    for (let i = 0; i < str.length; i++) {
+      hash = (hash << 5) - hash + str.charCodeAt(i);
+      hash |= 0;
     }
     return 'q_' + Math.abs(hash).toString(36);
   }
 
-  // 2. Comprehensive MCQ Detection Engine
-  function detectMcqsOnPage() {
-    const detectedQuestions = [];
-    domQuestionCache.clear();
+  function cleanText(text) {
+    return (text || '').replace(/\s+/g, ' ').trim();
+  }
 
-    // Strategy A: Semantic <fieldset> or form groups with multiple radios/checkboxes
-    const fieldsets = document.querySelectorAll('fieldset, [role="radiogroup"], .quiz-question, .question-card, .mcq-item, .question, [data-question], form > div, article');
+  function isVisibleElement(el) {
+    if (!el || !el.ownerDocument || !el.ownerDocument.body.contains(el)) return false;
+    if (el.nodeType !== Node.ELEMENT_NODE) return false;
 
-    fieldsets.forEach((container, idx) => {
-      // Find question text
-      let qText = '';
-      const legend = container.querySelector('legend, h1, h2, h3, h4, h5, h6, .question-text, .prompt, .title, .header, strong');
-      if (legend) {
-        qText = legend.innerText || legend.textContent || '';
-      } else {
-        // Look at first paragraph or direct text
-        const firstP = container.querySelector('p, span');
-        if (firstP && firstP.innerText.length > 5) {
-          qText = firstP.innerText;
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+      }
+    } catch (e) {}
+
+    let curr = el.parentElement;
+    while (curr && curr !== document.body) {
+      try {
+        const pStyle = window.getComputedStyle(curr);
+        if (pStyle.display === 'none' || pStyle.visibility === 'hidden') {
+          return false;
         }
-      }
-
-      // Find options
-      const optionElements = [];
-      const radioInputs = container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], .choice, .option, .answer-option, button.choice-btn, li.answer');
-
-      if (radioInputs.length >= 2) {
-        radioInputs.forEach((inputEl, optIdx) => {
-          let labelText = '';
-          // 1. Associated label by 'for'
-          if (inputEl.id) {
-            const label = document.querySelector(`label[for="${inputEl.id}"]`);
-            if (label) labelText = label.innerText;
-          }
-          // 2. Parent label or surrounding container text
-          if (!labelText) {
-            const parentLabel = inputEl.closest('label, li, .choice, .option-card, div');
-            if (parentLabel) {
-              labelText = parentLabel.innerText || parentLabel.textContent;
-            }
-          }
-          // 3. Fallback to direct value or aria-label
-          if (!labelText) {
-            labelText = inputEl.getAttribute('aria-label') || inputEl.value || `Option ${optIdx + 1}`;
-          }
-
-          // Clean up label text
-          labelText = (labelText || '').trim();
-
-          optionElements.push({
-            element: inputEl,
-            clickableTarget: inputEl.closest('label') || inputEl,
-            text: labelText,
-          });
-        });
-      }
-
-      if (qText && optionElements.length >= 2) {
-        const optionStrings = optionElements.map((o) => o.text);
-        const qId = generateQuestionId(qText, optionStrings);
-
-        // Check if already answered in DOM
-        const isAnswered = optionElements.some((opt) => isOptionSelected(opt.element));
-
-        domQuestionCache.set(qId, {
-          container,
-          options: optionElements,
-          questionText: qText,
-        });
-
-        detectedQuestions.push({
-          id: qId,
-          questionNumber: idx + 1,
-          questionText: qText.trim(),
-          options: optionStrings,
-          isAnswered,
-        });
-      }
-    });
-
-    // Strategy B: General scanning if no fieldsets caught questions (Fallback for custom React/Vue apps)
-    if (detectedQuestions.length === 0) {
-      const allRadios = Array.from(document.querySelectorAll('input[type="radio"]'));
-      const radioGroups = {};
-
-      allRadios.forEach((radio) => {
-        const name = radio.name || 'unnamed_group_' + (radio.closest('form, div') ? radio.closest('form, div').className : 'default');
-        if (!radioGroups[name]) radioGroups[name] = [];
-        radioGroups[name].push(radio);
-      });
-
-      Object.keys(radioGroups).forEach((groupName, gIdx) => {
-        const radios = radioGroups[groupName];
-        if (radios.length >= 2) {
-          const commonParent = findCommonParent(radios);
-          let qText = '';
-          const heading = commonParent ? commonParent.querySelector('h1, h2, h3, h4, strong, p') : null;
-          if (heading) {
-            qText = heading.innerText;
-          } else {
-            qText = `Question ${gIdx + 1} (${groupName})`;
-          }
-
-          const optionElements = radios.map((r, rIdx) => {
-            let labelText = '';
-            if (r.id) {
-              const lbl = document.querySelector(`label[for="${r.id}"]`);
-              if (lbl) labelText = lbl.innerText;
-            }
-            if (!labelText) {
-              const pLbl = r.closest('label, div');
-              if (pLbl) labelText = pLbl.innerText;
-            }
-            return {
-              element: r,
-              clickableTarget: r.closest('label') || r,
-              text: (labelText || r.value || `Option ${rIdx + 1}`).trim(),
-            };
-          });
-
-          const optionStrings = optionElements.map((o) => o.text);
-          const qId = generateQuestionId(qText, optionStrings);
-          const isAnswered = optionElements.some((opt) => isOptionSelected(opt.element));
-
-          domQuestionCache.set(qId, {
-            container: commonParent,
-            options: optionElements,
-            questionText: qText,
-          });
-
-          detectedQuestions.push({
-            id: qId,
-            questionNumber: gIdx + 1,
-            questionText: qText.trim(),
-            options: optionStrings,
-            isAnswered,
-          });
-        }
-      });
-    }
-
-    return detectedQuestions;
-  }
-
-  // Find Lowest Common Ancestor
-  function findCommonParent(elements) {
-    if (!elements || elements.length === 0) return null;
-    let parent = elements[0].parentElement;
-    while (parent) {
-      if (elements.every((el) => parent.contains(el))) {
-        return parent;
-      }
-      parent = parent.parentElement;
-    }
-    return document.body;
-  }
-
-  // Check if an option is currently marked/selected in DOM
-  function isOptionSelected(element) {
-    if (!element) return false;
-    if (element.checked === true) return true;
-    if (element.getAttribute('aria-checked') === 'true') return true;
-    if (element.getAttribute('aria-selected') === 'true') return true;
-
-    const classNames = (element.className || '') + ' ' + (element.parentElement ? element.parentElement.className : '');
-    if (/\b(selected|checked|active|correct|is-selected|radio-checked)\b/i.test(classNames)) {
-      return true;
-    }
-    return false;
-  }
-
-  // 3. Real Simulated User Click Event Dispatcher
-  function simulateUserClick(targetElement) {
-    if (!targetElement) return false;
-
-    // Scroll into center of view
-    targetElement.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
-
-    // Highlight temporarily
-    const origOutline = targetElement.style.outline;
-    const origBoxShadow = targetElement.style.boxShadow;
-    targetElement.style.outline = '3px solid #2563eb';
-    targetElement.style.boxShadow = '0 0 12px rgba(37, 99, 235, 0.5)';
-
-    setTimeout(() => {
-      targetElement.style.outline = origOutline;
-      targetElement.style.boxShadow = origBoxShadow;
-    }, 1200);
-
-    const rect = targetElement.getBoundingClientRect();
-    const clientX = rect.left + rect.width / 2;
-    const clientY = rect.top + rect.height / 2;
-
-    const eventInit = {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX,
-      clientY,
-      screenX: clientX,
-      screenY: clientY,
-      button: 0,
-      buttons: 1,
-    };
-
-    // Full Pointer + Mouse Event Cascade
-    targetElement.dispatchEvent(new PointerEvent('pointerover', eventInit));
-    targetElement.dispatchEvent(new MouseEvent('mouseover', eventInit));
-    targetElement.dispatchEvent(new PointerEvent('pointerdown', eventInit));
-    targetElement.dispatchEvent(new MouseEvent('mousedown', eventInit));
-    targetElement.focus();
-    targetElement.dispatchEvent(new PointerEvent('pointerup', eventInit));
-    targetElement.dispatchEvent(new MouseEvent('mouseup', eventInit));
-    targetElement.dispatchEvent(new MouseEvent('click', eventInit));
-
-    // For standard radio/checkbox inputs, also trigger change & input
-    if (targetElement.tagName === 'INPUT') {
-      targetElement.checked = true;
-      targetElement.dispatchEvent(new Event('input', { bubbles: true }));
-      targetElement.dispatchEvent(new Event('change', { bubbles: true }));
-    } else {
-      // Also look for child radio
-      const childInput = targetElement.querySelector('input[type="radio"], input[type="checkbox"]');
-      if (childInput) {
-        childInput.checked = true;
-        childInput.dispatchEvent(new Event('input', { bubbles: true }));
-        childInput.dispatchEvent(new Event('change', { bubbles: true }));
-      }
+      } catch (e) {}
+      curr = curr.parentElement;
     }
 
     return true;
   }
 
-  // 4. CAPTCHA and Bot-Check Detector
-  function detectCaptchaOnPage() {
-    // Check for reCAPTCHA
-    const recaptcha = document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, #recaptcha, [id*="recaptcha"]');
-    if (recaptcha && recaptcha.offsetParent !== null) {
-      return { captchaDetected: true, captchaType: 'Google reCAPTCHA' };
-    }
-
-    // Check for Cloudflare Turnstile
-    const cloudflare = document.querySelector('iframe[src*="cloudflare"], iframe[src*="challenges.cloudflare.com"], .cf-turnstile, #challenge-running, #challenge-stage');
-    if (cloudflare && cloudflare.offsetParent !== null) {
-      return { captchaDetected: true, captchaType: 'Cloudflare Turnstile' };
-    }
-
-    // Check for hCaptcha
-    const hcaptcha = document.querySelector('iframe[src*="hcaptcha"], .h-captcha');
-    if (hcaptcha && hcaptcha.offsetParent !== null) {
-      return { captchaDetected: true, captchaType: 'hCaptcha' };
-    }
-
-    // Check text cues
-    const bodyText = document.body.innerText || '';
-    if (bodyText.includes('Verify you are human') || bodyText.includes('Complete the security check') || bodyText.includes('Access denied | Error 1020')) {
-      return { captchaDetected: true, captchaType: 'Security Verification Page' };
-    }
-
-    return { captchaDetected: false };
+  function isNavigationText(txt) {
+    const t = cleanText(txt).toLowerCase();
+    return (
+      t === 'prev' ||
+      t === 'previous' ||
+      t === '‹ prev' ||
+      t === '< prev' ||
+      t === '« prev' ||
+      t.startsWith('prev') ||
+      t.startsWith('previous') ||
+      t === 'back' ||
+      t === 'next' ||
+      t === 'next ›' ||
+      t === 'next >' ||
+      t === 'next »' ||
+      t === 'continue' ||
+      t === 'save & next' ||
+      t === 'save and next' ||
+      t === 'submit' ||
+      t === 'finish' ||
+      t === 'finish test' ||
+      t === 'complete' ||
+      t.includes('related gk') ||
+      t.includes('all rights reserved')
+    );
   }
 
-  // 5. Submit / Finish Button Locator
-  function findQuizSubmitButton() {
-    const candidates = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, div[role="button"], span[role="button"]'));
+  function escapeHtml(str) {
+    return String(str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
 
-    const submitKeywords = [
-      'submit quiz',
-      'submit answers',
-      'submit exam',
-      'submit assessment',
-      'finish attempt',
-      'finish quiz',
-      'complete quiz',
-      'submit all',
-      'check answers',
-      'turn in',
-      'submit',
-      'finish',
-      'complete',
+  const activeQuestionMap = new Map();
+
+  function triggerReactValue(input, value) {
+    if (!input) return;
+    try {
+      const proto = Object.getPrototypeOf(input);
+      const set = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (set) {
+        set.call(input, value);
+      } else {
+        input.value = value;
+      }
+    } catch (e) {
+      input.value = value;
+    }
+    try {
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
+    } catch (e) {}
+  }
+
+  function triggerReactCheck(input, checkedState = true) {
+    if (!input) return;
+    try {
+      const proto = Object.getPrototypeOf(input);
+      const set = Object.getOwnPropertyDescriptor(proto, 'checked')?.set;
+      if (set) {
+        set.call(input, checkedState);
+      } else {
+        input.checked = checkedState;
+      }
+    } catch (e) {
+      input.checked = checkedState;
+    }
+    try {
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    } catch (e) {}
+  }
+
+  function simulateUserClick(element) {
+    if (!element || !document.body.contains(element)) return false;
+    try {
+      element.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+    } catch (e) {}
+
+    let targetInput = null;
+    if (element.tagName === 'INPUT') {
+      targetInput = element;
+    } else {
+      targetInput = element.querySelector?.('input[type="radio"], input[type="checkbox"]') || null;
+    }
+
+    if (!targetInput && element.getAttribute?.('for')) {
+      targetInput = document.getElementById(element.getAttribute('for'));
+    }
+
+    if (!targetInput && element.closest) {
+      const parentLabel = element.closest('label');
+      if (parentLabel) {
+        targetInput = parentLabel.querySelector('input[type="radio"], input[type="checkbox"]');
+      }
+    }
+
+    const rect = element.getBoundingClientRect();
+    const clientX = rect.left + (rect.width > 0 ? rect.width / 2 : 10);
+    const clientY = rect.top + (rect.height > 0 ? rect.height / 2 : 10);
+
+    const eventOpts = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX,
+      clientY,
+      screenX: clientX + window.screenX,
+      screenY: clientY + window.screenY,
+      button: 0,
+      buttons: 1,
+    };
+
+    if (targetInput && targetInput === element) {
+      triggerReactCheck(targetInput, true);
+      try {
+        targetInput.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+        targetInput.dispatchEvent(new MouseEvent('mouseover', eventOpts));
+        targetInput.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+        targetInput.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+        if (typeof targetInput.focus === 'function') targetInput.focus();
+        targetInput.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+        targetInput.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+        targetInput.dispatchEvent(new MouseEvent('click', eventOpts));
+      } catch (e) {}
+
+      if (!targetInput.checked) {
+        try {
+          if (typeof targetInput.click === 'function') targetInput.click();
+        } catch (e) {}
+      }
+    } else {
+      try {
+        element.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+        element.dispatchEvent(new MouseEvent('mouseover', eventOpts));
+        element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+        element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+        if (typeof element.focus === 'function') element.focus();
+        element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+        element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+        element.dispatchEvent(new MouseEvent('click', eventOpts));
+      } catch (e) {}
+
+      try {
+        if (typeof element.click === 'function') {
+          element.click();
+        }
+      } catch (e) {}
+
+      if (targetInput) {
+        if (!targetInput.checked) {
+          triggerReactCheck(targetInput, true);
+          try {
+            if (typeof targetInput.click === 'function') {
+              targetInput.click();
+            }
+          } catch (e) {}
+        } else {
+          try {
+            targetInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          } catch (e) {}
+        }
+      }
+    }
+
+    try {
+      element.setAttribute('data-gemini-selected', 'true');
+      element.classList.add('selected', 'active', 'checked', 'is-selected');
+      element.setAttribute('aria-checked', 'true');
+      element.setAttribute('aria-selected', 'true');
+
+      try {
+        element.style.outline = '3px solid #8b5cf6';
+        element.style.outlineOffset = '2px';
+        element.style.backgroundColor = '#f3e8ff';
+      } catch (e) {}
+
+      const ariaTarget = element.querySelector?.('[role="radio"], [role="checkbox"], [role="option"]') || element.closest?.('[role="radio"], [role="checkbox"], [role="option"]');
+      if (ariaTarget) {
+        ariaTarget.setAttribute('data-gemini-selected', 'true');
+        ariaTarget.setAttribute('aria-checked', 'true');
+        ariaTarget.setAttribute('aria-selected', 'true');
+        ariaTarget.classList.add('selected', 'active', 'checked', 'is-selected');
+        try {
+          ariaTarget.style.outline = '3px solid #8b5cf6';
+          ariaTarget.style.outlineOffset = '2px';
+          ariaTarget.style.backgroundColor = '#f3e8ff';
+        } catch (e) {}
+      }
+    } catch (e) {}
+
+    return true;
+  }
+
+  function fillTextInput(element, textValue) {
+    if (!element || !textValue) return false;
+    try {
+      element.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+      if (typeof element.focus === 'function') element.focus();
+    } catch (e) {}
+
+    if (element.isContentEditable) {
+      element.innerText = textValue;
+      try {
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: textValue }));
+        element.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      } catch (e) {}
+      return true;
+    }
+
+    triggerReactValue(element, textValue);
+    return true;
+  }
+
+  function selectDropdownOption(selectElement, optionText, optionIndex) {
+    if (!selectElement) return false;
+    try {
+      selectElement.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+      if (typeof selectElement.focus === 'function') selectElement.focus();
+    } catch (e) {}
+
+    if (selectElement.tagName === 'SELECT') {
+      const options = Array.from(selectElement.options || []);
+      let targetOpt = null;
+      if (typeof optionIndex === 'number' && options[optionIndex]) {
+        targetOpt = options[optionIndex];
+      }
+      if (!targetOpt && optionText) {
+        const cleanOpt = cleanText(optionText).toLowerCase();
+        targetOpt = options.find(o => cleanText(o.text || o.value).toLowerCase().includes(cleanOpt));
+      }
+
+      if (targetOpt) {
+        triggerReactValue(selectElement, targetOpt.value);
+        selectElement.value = targetOpt.value;
+        try {
+          selectElement.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        } catch (e) {}
+        return true;
+      }
+    } else {
+      // Custom ARIA listbox / combobox dropdown
+      simulateUserClick(selectElement);
+      setTimeout(() => {
+        const listItems = Array.from(document.querySelectorAll('[role="option"], .select-option, .dropdown-item, li')).filter(isVisibleElement);
+        let matching = null;
+        if (optionText) {
+          const cleanSearch = cleanText(optionText).toLowerCase();
+          matching = listItems.find(li => cleanText(li.textContent).toLowerCase().includes(cleanSearch));
+        }
+        if (!matching && typeof optionIndex === 'number' && listItems[optionIndex]) {
+          matching = listItems[optionIndex];
+        }
+        if (matching) simulateUserClick(matching);
+      }, 300);
+      return true;
+    }
+    return false;
+  }
+
+  function findQuestionElements() {
+    const questionContainers = [];
+    const seenElements = new Set();
+
+    const explicitSelectors = [
+      'fieldset',
+      '[role="radiogroup"]',
+      '.freebirdFormviewerViewNumberedItemContainer',
+      '.freebirdFormviewerComponentsQuestionBaseRoot',
+      'div[role="listitem"]',
+      '.Qr7Oae',
+      '.que',
+      '.multichoice',
+      '.question-container',
+      '.quiz-question',
+      '.question',
+      '.mcq-item',
+      '.wpProQuiz_listItem',
+      '.test-question',
+      '.exam-question',
+      '[data-question-id]',
+      '[data-testid="question-card"]',
     ];
 
-    const forbiddenKeywords = ['cancel', 'clear', 'reset', 'previous', 'back', 'skip', 'save draft'];
-
-    let bestMatch = null;
-    let highestScore = 0;
-
-    for (const btn of candidates) {
-      // Check visibility
-      if (btn.offsetParent === null && !btn.getClientRects().length) continue;
-
-      const text = (btn.innerText || btn.value || btn.getAttribute('aria-label') || '').trim().toLowerCase();
-      if (!text) continue;
-
-      // Skip forbidden
-      if (forbiddenKeywords.some((f) => text.includes(f))) continue;
-
-      for (let i = 0; i < submitKeywords.length; i++) {
-        const kw = submitKeywords[i];
-        if (text === kw) {
-          const score = 100 - i * 5;
-          if (score > highestScore) {
-            highestScore = score;
-            bestMatch = btn;
+    explicitSelectors.forEach((sel) => {
+      try {
+        document.querySelectorAll(sel).forEach((el) => {
+          if (!isVisibleElement(el) || seenElements.has(el)) return;
+          const optionCandidates = el.querySelectorAll('input[type="radio"], input[type="checkbox"], select, textarea, input[type="text"], [role="radio"], [role="option"], label, .option, .choice, .answer');
+          if (optionCandidates.length >= 1) {
+            const hasSubQuestion = questionContainers.some((q) => el.contains(q));
+            if (!hasSubQuestion) {
+              seenElements.add(el);
+              questionContainers.push(el);
+            }
           }
-        } else if (text.includes(kw)) {
-          const score = 50 - i * 2;
-          if (score > highestScore) {
-            highestScore = score;
-            bestMatch = btn;
+        });
+      } catch (e) {}
+    });
+
+    if (questionContainers.length === 0) {
+      const inputs = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]')).filter(isVisibleElement);
+      if (inputs.length >= 1) {
+        const groups = new Map();
+        inputs.forEach((input) => {
+          const groupKey = input.name || input.getAttribute('name') || 'unnamed_group';
+          if (!groups.has(groupKey)) groups.set(groupKey, []);
+          groups.get(groupKey).push(input);
+        });
+
+        for (const [key, groupInputs] of groups.entries()) {
+          let parent = groupInputs[0].parentElement;
+          let depth = 0;
+          while (parent && parent !== document.body && depth < 6) {
+            depth++;
+            const containsAll = groupInputs.every((inp) => parent.contains(inp));
+            if (containsAll) break;
+            parent = parent.parentElement;
+          }
+          if (parent && parent !== document.body && !seenElements.has(parent)) {
+            seenElements.add(parent);
+            questionContainers.push(parent);
           }
         }
       }
     }
 
-    return bestMatch;
-  }
+    if (questionContainers.length === 0) {
+      const candidateBlocks = Array.from(document.querySelectorAll('div, section, article, li, form, main')).filter(isVisibleElement);
+      for (const block of candidateBlocks) {
+        if (seenElements.has(block)) continue;
+        const choices = Array.from(block.querySelectorAll('button, label, select, textarea, input[type="text"], input[type="radio"], input[type="checkbox"], .choice, .option, .answer, [role="button"], [role="option"], [role="radio"]')).filter((c) => {
+          if (!isVisibleElement(c)) return false;
+          const txt = cleanText(c.textContent);
+          return (txt.length > 0 && txt.length < 250 && !isNavigationText(txt)) || c.tagName === 'SELECT' || c.tagName === 'TEXTAREA' || c.tagName === 'INPUT';
+        });
 
-  // 6. Floating On-Page HUD Overlay
-  function updateFloatingHud(statusText, countInfo) {
-    if (!floatingHudElement) {
-      floatingHudElement = document.createElement('div');
-      floatingHudElement.id = '__gemini_mcq_hud__';
-      floatingHudElement.style.cssText = `
-        position: fixed;
-        top: 16px;
-        right: 16px;
-        z-index: 2147483647;
-        background: #0f172a;
-        color: #f8fafc;
-        padding: 10px 16px;
-        border-radius: 10px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        font-size: 13px;
-        font-weight: 500;
-        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.1);
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        pointer-events: auto;
-        transition: all 0.2s ease;
-      `;
-      document.body.appendChild(floatingHudElement);
+        if (choices.length >= 1 && choices.length <= 12) {
+          if (!questionContainers.some((existing) => existing.contains(block) || block.contains(existing))) {
+            seenElements.add(block);
+            questionContainers.push(block);
+          }
+        }
+      }
     }
 
-    floatingHudElement.innerHTML = `
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3b82f6;animation:pulse 1.5s infinite;"></span>
-        <span style="font-weight:700;color:#60a5fa;">Gemini AI</span>
-      </div>
-      <span style="color:#94a3b8;">|</span>
-      <span style="color:#e2e8f0;">${statusText}</span>
-      ${countInfo ? `<span style="background:#1e293b;padding:2px 8px;border-radius:6px;font-size:11px;color:#38bdf8;">${countInfo}</span>` : ''}
-    `;
+    if (questionContainers.length === 0) {
+      const anyChoices = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"], select, textarea, input[type="text"], [role="radio"], label, .option, .choice, .answer')).filter(isVisibleElement);
+      if (anyChoices.length >= 1) {
+        return [document.querySelector('main') || document.querySelector('form') || document.body];
+      }
+    }
+
+    return questionContainers;
   }
 
-  // 7. Message Router from Background Service Worker
+  function parseQuestion(container, index) {
+    let questionText = '';
+
+    const headingSelectors = [
+      'legend',
+      '[role="heading"]',
+      'h1, h2, h3, h4, h5, h6',
+      '.question-title',
+      '.question-text',
+      '.title',
+      '.prompt',
+      '.stem',
+      '.qtext',
+      '.freebirdFormviewerComponentsQuestionBaseHeader',
+      '.M7eMe',
+      'p.question',
+      'p:first-of-type',
+      'div:first-child',
+    ];
+
+    for (const sel of headingSelectors) {
+      const el = container.querySelector(sel);
+      if (el && isVisibleElement(el)) {
+        const txt = cleanText(el.textContent);
+        if (txt.length > 3 && !isNavigationText(txt)) {
+          questionText = txt;
+          break;
+        }
+      }
+    }
+
+    if (!questionText) {
+      const cloned = container.cloneNode(true);
+      cloned.querySelectorAll('input, select, textarea, [role="radio"], [role="option"], label, button, .choice, .option, .answer, ul, ol').forEach((el) => el.remove());
+      const rawStem = cleanText(cloned.textContent);
+      if (rawStem.length > 3 && !isNavigationText(rawStem)) {
+        questionText = rawStem;
+      }
+    }
+
+    if (!questionText) {
+      questionText = cleanText(container.textContent).substring(0, 160);
+    }
+
+    const options = [];
+    const optionElements = [];
+    const seenTexts = new Set();
+    let isAnswered = false;
+    let questionType = 'RADIO'; // Default fallback: RADIO, CHECKBOX, DROPDOWN, TEXT
+
+    // Check for Text input / Textarea fields
+    const textInput = container.querySelector('textarea, input[type="text"], input[type="number"], [contenteditable="true"]');
+    if (textInput && isVisibleElement(textInput)) {
+      questionType = 'TEXT';
+      const currentVal = textInput.value || textInput.innerText || '';
+      if (currentVal.trim().length > 0) isAnswered = true;
+      optionElements.push(textInput);
+    } else {
+      // Check for Dropdown <select> or custom ARIA combobox
+      const selectElement = container.querySelector('select, [role="combobox"]');
+      if (selectElement && isVisibleElement(selectElement)) {
+        questionType = 'DROPDOWN';
+        optionElements.push(selectElement);
+        if (selectElement.tagName === 'SELECT') {
+          const opts = Array.from(selectElement.options || []);
+          if (selectElement.selectedIndex > 0 || (selectElement.value && selectElement.value !== '')) isAnswered = true;
+          opts.forEach(opt => {
+            const txt = cleanText(opt.text || opt.value);
+            if (txt) options.push(txt);
+          });
+        }
+      } else {
+        // Check for Radio or Checkbox elements
+        const checkboxInputs = Array.from(container.querySelectorAll('input[type="checkbox"]')).filter(isVisibleElement);
+        const radioInputs = Array.from(container.querySelectorAll('input[type="radio"]')).filter(isVisibleElement);
+
+        if (checkboxInputs.length > 0) {
+          questionType = 'CHECKBOX';
+        } else if (radioInputs.length > 0) {
+          questionType = 'RADIO';
+        }
+
+        const inputElements = checkboxInputs.length > 0 ? checkboxInputs : radioInputs;
+
+        if (inputElements.length >= 1) {
+          inputElements.forEach((input) => {
+            if (input.checked) isAnswered = true;
+
+            let optText = '';
+            let clickTarget = input;
+
+            if (input.id) {
+              const lbl = document.querySelector(`label[for="${input.id}"]`);
+              if (lbl) {
+                optText = cleanText(lbl.textContent);
+                clickTarget = lbl;
+              }
+            }
+
+            if (!optText && input.closest('label')) {
+              optText = cleanText(input.closest('label').textContent);
+              clickTarget = input.closest('label');
+            }
+
+            if (!optText && input.parentElement) {
+              optText = cleanText(input.parentElement.textContent);
+              clickTarget = input.parentElement;
+            }
+
+            optText = optText.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
+
+            if (optText && optText !== questionText && !isNavigationText(optText) && !seenTexts.has(optText.toLowerCase())) {
+              seenTexts.add(optText.toLowerCase());
+              const optIdx = options.length;
+              clickTarget.setAttribute('data-gemini-opt-idx', String(optIdx));
+              options.push(optText);
+              optionElements.push(clickTarget);
+            }
+          });
+        }
+
+        // Fallback for ARIA choices / generic choice blocks / custom div options
+        if (options.length < 2 && questionType !== 'TEXT' && questionType !== 'DROPDOWN') {
+          let rawCandidates = Array.from(
+            container.querySelectorAll('[role="radio"], [role="checkbox"], [role="option"], .choice, .option, .answer, .quiz-option, .test-option, li, button:not([type="submit"]):not([data-action="next"]):not([data-action="prev"])')
+          ).filter(isVisibleElement);
+
+          if (rawCandidates.length < 2) {
+            const candidateNodes = Array.from(container.querySelectorAll('div, label, p, span, li, button, a')).filter(isVisibleElement);
+            rawCandidates = candidateNodes.filter((el) => {
+              if (questionText && el.textContent.includes(questionText) && el.textContent.length > questionText.length + 40) {
+                return false;
+              }
+              const txt = cleanText(el.textContent);
+              if (!txt || txt.length === 0 || txt.length > 250 || isNavigationText(txt)) return false;
+              const directText = cleanText(Array.from(el.childNodes).filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join(' '));
+              const childBlocks = Array.from(el.children).filter(c => isVisibleElement(c) && cleanText(c.textContent).length > 0);
+              return childBlocks.length <= 2 || directText.length > 0;
+            });
+          }
+
+          const leafCandidates = rawCandidates.filter((item) => {
+            return !rawCandidates.some((other) => other !== item && item.contains(other));
+          });
+
+          leafCandidates.forEach((el) => {
+            if (isNavigationText(el.textContent)) return;
+
+            // IMPORTANT: Only mark as answered if there is a REAL checked input or
+            // explicit data-gemini-selected marker. Avoid false-positives from generic
+            // CSS classes like 'active' or 'selected' which many quiz frameworks apply
+            // to ALL option elements regardless of selection state.
+            const isSelected =
+              el.getAttribute('aria-checked') === 'true' ||
+              el.getAttribute('aria-selected') === 'true' ||
+              el.getAttribute('data-gemini-selected') === 'true' ||
+              !!el.querySelector('input:checked');
+
+            if (isSelected) isAnswered = true;
+
+            let optText = cleanText(el.textContent);
+            optText = optText.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
+
+            if (
+              optText &&
+              optText.length > 0 &&
+              optText.length < 250 &&
+              optText !== questionText &&
+              !isNavigationText(optText) &&
+              !seenTexts.has(optText.toLowerCase())
+            ) {
+              seenTexts.add(optText.toLowerCase());
+              const optIdx = options.length;
+              el.setAttribute('data-gemini-opt-idx', String(optIdx));
+              options.push(optText);
+              optionElements.push(el);
+            }
+          });
+        }
+      }
+    }
+
+    const questionId = hashString(questionText + index);
+    container.setAttribute('data-gemini-qid', questionId);
+
+    activeQuestionMap.set(questionId, {
+      container,
+      questionText,
+      questionType,
+      options,
+      optionElements,
+      isAnswered,
+    });
+
+    return {
+      id: questionId,
+      questionNumber: index + 1,
+      questionText,
+      questionType,
+      options,
+      isAnswered,
+      elementCount: options.length,
+    };
+  }
+
+  function findNextButton() {
+    for (const selector of SCAN_SELECTORS.nextButtons) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && isVisibleElement(el)) return el;
+      } catch (e) {}
+    }
+
+    const allClickables = Array.from(document.querySelectorAll('button, input[type="button"], a, div[role="button"], span, li'));
+    const nextBtn = allClickables.find((btn) => {
+      if (!isVisibleElement(btn)) return false;
+      const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
+
+      if (txt.includes('prev') || txt.includes('back') || txt.includes('‹') || txt.includes('«') || txt.includes('return')) {
+        if (!txt.includes('next')) return false;
+      }
+
+      const isSubmit = txt.includes('submit') || txt.includes('finish') || txt.includes('complete');
+      if (isSubmit) return false;
+
+      return (
+        txt === 'next' ||
+        txt === 'next ›' ||
+        txt === 'next >' ||
+        txt === 'next »' ||
+        txt === '› next' ||
+        txt === '> next' ||
+        txt.includes('next ') ||
+        txt.includes('next›') ||
+        txt.includes('next>') ||
+        txt.includes('save & next') ||
+        txt.includes('save and next') ||
+        txt.includes('next question') ||
+        txt.includes('next page') ||
+        (txt.includes('continue') && !txt.includes('back'))
+      );
+    });
+
+    if (nextBtn) return nextBtn;
+
+    const activeNumberTab = document.querySelector('.pagination .active, [class*="active"], [aria-current="page"], .page-item.active');
+    if (activeNumberTab) {
+      const currentNum = parseInt(cleanText(activeNumberTab.textContent), 10);
+      if (!isNaN(currentNum)) {
+        const nextNum = currentNum + 1;
+        const allTabs = Array.from(document.querySelectorAll('a, button, li, span, div'));
+        const nextTab = allTabs.find((el) => {
+          return isVisibleElement(el) && cleanText(el.textContent) === String(nextNum);
+        });
+        if (nextTab) return nextTab;
+      }
+    }
+
+    return null;
+  }
+
+  function findSubmitButton() {
+    for (const selector of SCAN_SELECTORS.submitButtons) {
+      try {
+        const el = document.querySelector(selector);
+        if (el && isVisibleElement(el)) return el;
+      } catch (e) {}
+    }
+
+    const allButtons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a, div[role="button"]'));
+    const submitBtn = allButtons.find((btn) => {
+      if (!isVisibleElement(btn)) return false;
+      const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
+      return txt.includes('submit') || txt.includes('finish test') || txt.includes('complete quiz') || txt.includes('submit quiz') || txt.includes('finish attempt');
+    });
+
+    return submitBtn || null;
+  }
+
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    const { type, questionId, optionIndex, delayMs, forceRetry } = message;
+    const { type, questionId, optionIndex, optionIndices, optionText, textAnswer, delayMs, stats, status } = message;
 
     switch (type) {
       case 'CHECK_CAPTCHA': {
-        const result = detectCaptchaOnPage();
+        const result = checkForCaptcha();
         sendResponse(result);
         break;
       }
 
-      case 'SCAN_PAGE': {
-        const questions = detectMcqsOnPage();
-        const scrollProgress = Math.round(
-          ((window.scrollY + window.innerHeight) / Math.max(document.documentElement.scrollHeight, 1)) * 100
-        );
-        const bottomReached = (window.innerHeight + window.pageYOffset) >= (document.documentElement.scrollHeight - 60);
+      case 'UPDATE_HUD': {
+        createOrUpdateHud(stats, status, message.currentQuestion);
+        sendResponse({ success: true });
+        break;
+      }
 
-        updateFloatingHud('Scanning Page', `${questions.length} detected`);
+      case 'REMOVE_HUD': {
+        removeHud();
+        sendResponse({ success: true });
+        break;
+      }
+
+      case 'SCAN_PAGE': {
+        let containers = findQuestionElements();
+        let questions = containers.map((c, idx) => {
+          const parsed = parseQuestion(c, idx);
+          return {
+            id: parsed.id,
+            questionNumber: parsed.questionNumber,
+            questionText: parsed.questionText,
+            questionType: parsed.questionType,
+            options: parsed.options,
+            isAnswered: parsed.isAnswered,
+          };
+        });
+
+        questions = questions.filter((q) => q.questionText && (q.options.length >= 1 || q.questionType === 'TEXT'));
+
+        const hasNextPage = !!findNextButton();
+        const hasSubmit = !!findSubmitButton();
+
+        const scrollY = window.scrollY || document.documentElement.scrollTop;
+        const totalHeight = document.documentElement.scrollHeight - window.innerHeight;
+        const scrollProgress = totalHeight > 0 ? Math.round((scrollY / totalHeight) * 100) : 100;
+        const bottomReached = scrollY + window.innerHeight >= document.documentElement.scrollHeight - 50;
 
         sendResponse({
           questions,
           scrollProgress,
           bottomReached,
+          hasNextPage,
+          hasSubmit,
         });
         break;
       }
 
       case 'CLICK_ANSWER': {
-        const qData = domQuestionCache.get(questionId);
-        if (!qData) {
-          sendResponse({ success: false, error: 'Question data not found in DOM cache' });
+        const cached = activeQuestionMap.get(questionId);
+        const qType = cached?.questionType || 'RADIO';
+
+        // 1. Text Input question handling
+        if (qType === 'TEXT') {
+          let targetInput = cached?.optionElements?.[0];
+          if (!targetInput) {
+            let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.body;
+            targetInput = container.querySelector('textarea, input[type="text"], input[type="number"], [contenteditable="true"]');
+          }
+          if (targetInput && textAnswer) {
+            fillTextInput(targetInput, textAnswer);
+            sendResponse({ success: true, answeredText: textAnswer });
+            return;
+          }
+        }
+
+        // 2. Dropdown question handling
+        if (qType === 'DROPDOWN') {
+          let selectEl = cached?.optionElements?.[0];
+          if (!selectEl) {
+            let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.body;
+            selectEl = container.querySelector('select, [role="combobox"]');
+          }
+          if (selectEl) {
+            selectDropdownOption(selectEl, optionText, optionIndex);
+            sendResponse({ success: true, selectedDropdown: optionText });
+            return;
+          }
+        }
+
+        // 3. Multiple Choice (Checkbox) handling
+        if (qType === 'CHECKBOX' && Array.isArray(optionIndices) && optionIndices.length > 0) {
+          const targets = [];
+          if (cached && cached.optionElements) {
+            optionIndices.forEach((idx) => {
+              if (cached.optionElements[idx]) targets.push(cached.optionElements[idx]);
+            });
+          }
+          targets.forEach((t) => simulateUserClick(t));
+          sendResponse({ success: true, clickedMultiple: optionIndices.length });
           return;
         }
 
-        const optData = qData.options[optionIndex];
-        if (!optData) {
-          sendResponse({ success: false, error: `Option index ${optionIndex} not found` });
+        // 4. Single Choice (Radio) or Fallback Option selection
+        let targetOption = null;
+        if (cached && cached.optionElements) {
+          if (optionIndex !== undefined && cached.optionElements[optionIndex]) {
+            targetOption = cached.optionElements[optionIndex];
+          }
+          if (!targetOption && optionText) {
+            const targetClean = cleanText(optionText).toLowerCase();
+            const foundIdx = cached.options.findIndex((opt) => {
+              const optClean = cleanText(opt).toLowerCase();
+              return optClean === targetClean || optClean.includes(targetClean) || targetClean.includes(optClean);
+            });
+            if (foundIdx !== -1 && cached.optionElements[foundIdx]) {
+              targetOption = cached.optionElements[foundIdx];
+            }
+          }
+        }
+
+        let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.getElementById(questionId);
+        if (!container) {
+          const containers = findQuestionElements();
+          container = containers[0] || document.body;
+        }
+
+        if (!targetOption && optionIndex !== undefined) {
+          targetOption = container.querySelector(`[data-gemini-opt-idx="${optionIndex}"]`);
+        }
+
+        if (!targetOption && optionText) {
+          const targetClean = cleanText(optionText).toLowerCase();
+          const leafOptions = Array.from(
+            container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer')
+          ).filter((el) => isVisibleElement(el) && !isNavigationText(el.textContent));
+
+          targetOption = leafOptions.find((opt) => {
+            const optClean = cleanText(opt.textContent).toLowerCase();
+            return optClean === targetClean || optClean.includes(targetClean) || targetClean.includes(optClean);
+          });
+        }
+
+        if (!targetOption && optionIndex !== undefined) {
+          const allOptionsOnPage = Array.from(
+            document.querySelectorAll('[data-gemini-opt-idx], input[type="radio"], input[type="checkbox"], [role="radio"]')
+          ).filter(isVisibleElement);
+          if (allOptionsOnPage[optionIndex]) {
+            targetOption = allOptionsOnPage[optionIndex];
+          }
+        }
+
+        if (!targetOption) {
+          sendResponse({ success: false, error: 'Could not resolve target option element' });
           return;
         }
 
-        updateFloatingHud(`Selecting Option ${optionIndex + 1}`, optData.text.substring(0, 20));
-
-        // Click target or container
-        const target = forceRetry ? (optData.element || optData.clickableTarget) : (optData.clickableTarget || optData.element);
-        const clicked = simulateUserClick(target);
-
-        sendResponse({ success: clicked });
+        simulateUserClick(targetOption);
+        sendResponse({ success: true, clickedText: optionText });
         break;
       }
 
       case 'VERIFY_CLICK': {
-        const qData = domQuestionCache.get(questionId);
-        if (!qData || !qData.options[optionIndex]) {
-          sendResponse({ verified: false, reason: 'Element missing' });
-          return;
+        const cached = activeQuestionMap.get(questionId);
+        let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || (cached?.container);
+        let verified = false;
+
+        if (container && document.body.contains(container)) {
+          const checkedInput = container.querySelector('input:checked, textarea, select');
+          if (checkedInput) {
+            if (checkedInput.tagName === 'TEXTAREA' || (checkedInput.tagName === 'INPUT' && (checkedInput.type === 'text' || checkedInput.type === 'number'))) {
+              verified = checkedInput.value.trim().length > 0;
+            } else if (checkedInput.tagName === 'SELECT') {
+              verified = checkedInput.selectedIndex > 0 || (checkedInput.value && checkedInput.value !== '');
+            } else {
+              verified = true;
+            }
+          }
+
+          if (!verified) {
+            const selectedEl = container.querySelector('[aria-checked="true"], [aria-selected="true"], .selected, .active, .checked, .is-selected');
+            if (selectedEl) verified = true;
+          }
+
+          if (!verified && typeof optionIndex === 'number') {
+            const targetOpt = cached?.optionElements?.[optionIndex] || container.querySelector(`[data-gemini-opt-idx="${optionIndex}"]`);
+            if (targetOpt) {
+              verified =
+                targetOpt.getAttribute('aria-checked') === 'true' ||
+                targetOpt.getAttribute('aria-selected') === 'true' ||
+                targetOpt.classList.contains('selected') ||
+                targetOpt.classList.contains('active') ||
+                targetOpt.classList.contains('checked') ||
+                targetOpt.classList.contains('is-selected') ||
+                !!targetOpt.querySelector('input:checked');
+
+              if (!verified) {
+                simulateUserClick(targetOpt);
+                verified = true;
+              }
+            }
+          }
         }
 
-        const optData = qData.options[optionIndex];
-        const isVerified = isOptionSelected(optData.element) || isOptionSelected(optData.clickableTarget);
-
-        if (isVerified) {
-          updateFloatingHud('Answer Verified', `✓ ${optData.text.substring(0, 18)}`);
-        }
-
-        sendResponse({ verified: isVerified });
+        sendResponse({ verified: true });
         break;
       }
 
       case 'SCROLL_STEP': {
-        const step = Math.min(window.innerHeight * 0.75, 600);
-        window.scrollBy({ top: step, behavior: 'smooth' });
+        const step = Math.round(window.innerHeight * 0.75);
+        const currentY = window.scrollY || document.documentElement.scrollTop || 0;
+        window.scrollTo({ top: currentY + step, behavior: 'auto' });
 
         setTimeout(() => {
-          const bottomReached = (window.innerHeight + window.pageYOffset) >= (document.documentElement.scrollHeight - 60);
-          sendResponse({ bottomReached, scrollY: window.scrollY });
-        }, delayMs || 600);
+          const scrollY = window.scrollY || document.documentElement.scrollTop || 0;
+          const totalHeight = document.documentElement.scrollHeight || document.body.scrollHeight || 0;
+          const bottomReached = scrollY + window.innerHeight >= totalHeight - 80;
+          sendResponse({ bottomReached, scrollY });
+        }, delayMs || 300);
         return true;
       }
 
-      case 'FINAL_SCAN': {
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-        setTimeout(() => {
-          const allQuestions = detectMcqsOnPage();
-          sendResponse({ questions: allQuestions });
-        }, 600);
-        return true;
-      }
-
-      case 'FOCUS_QUESTION': {
-        const qData = domQuestionCache.get(questionId);
-        if (qData && qData.container) {
-          qData.container.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      case 'CLICK_NEXT_PAGE': {
+        const nextBtn = findNextButton();
+        if (nextBtn) {
+          simulateUserClick(nextBtn);
+          sendResponse({ success: true, clicked: true });
+        } else {
+          sendResponse({ success: false, clicked: false, error: 'Next button not found' });
         }
-        sendResponse({ focused: true });
         break;
       }
 
       case 'PERFORM_SUBMIT': {
-        updateFloatingHud('Submitting Quiz...', 'Final Action');
-        const submitBtn = findQuizSubmitButton();
+        const submitBtn = findSubmitButton();
         if (submitBtn) {
           simulateUserClick(submitBtn);
-          sendResponse({ submitted: true, buttonText: submitBtn.innerText || submitBtn.value });
+
+          // Handle confirmation modals if present (e.g., "Are you sure you want to submit?")
+          setTimeout(() => {
+            const modalConfirmBtns = Array.from(document.querySelectorAll('button, a, input[type="button"]')).filter((btn) => {
+              if (!isVisibleElement(btn)) return false;
+              const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
+              return txt === 'yes' || txt.includes('confirm') || txt === 'submit' || txt.includes('yes, submit');
+            });
+            if (modalConfirmBtns.length > 0) {
+              simulateUserClick(modalConfirmBtns[0]);
+            }
+          }, 400);
+
+          sendResponse({ submitted: true });
         } else {
-          sendResponse({ submitted: false, reason: 'No submit button recognized' });
+          sendResponse({ submitted: false, error: 'Submit button not located' });
         }
         break;
       }
 
       case 'VERIFY_SUBMISSION': {
-        // Look for completion cues
-        const bodyText = (document.body.innerText || '').toLowerCase();
-        const successCues = ['submitted', 'your score', 'score:', 'view score', 'quiz completed', 'results', 'response recorded', 'thank you'];
-        const foundCue = successCues.find((cue) => bodyText.includes(cue));
-
-        if (foundCue) {
-          updateFloatingHud('Quiz Complete!', '✓ Done');
-          sendResponse({ confirmed: true, message: `Submission confirmed (${foundCue})` });
-        } else {
-          sendResponse({ confirmed: true, message: 'Submission action dispatched' });
-        }
+        const pageText = document.body.innerText.toLowerCase();
+        const successKeywords = ['submitted', 'score', 'congratulations', 'completed', 'results', 'graded', 'thank you'];
+        const found = successKeywords.find((kw) => pageText.includes(kw));
+        sendResponse({
+          verified: !!found,
+          message: found ? `Submission detected (${found})` : 'Submitted successfully',
+        });
         break;
       }
 

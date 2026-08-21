@@ -37,7 +37,6 @@ let sessionState = {
   config: { ...DEFAULT_CONFIG },
 };
 
-// Initialize storage and keepalive alarm
 chrome.runtime.onInstalled.addListener(async () => {
   await hydrateConfig();
   log('info', 'Gemini MCQ Solver Service Worker initialized.');
@@ -45,30 +44,48 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.runtime.onStartup.addListener(async () => {
   await hydrateConfig();
+  if (isAutomationActive && sessionState.targetTabId && !isLoopRunning) {
+    runAutomationLoop(sessionState.targetTabId);
+  }
 });
 
-// Alarms keepalive so Chrome does not terminate the background worker when user switches tabs
 chrome.alarms.create('gemini_solver_keepalive', { periodInMinutes: 0.2 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'gemini_solver_keepalive') {
-    if (sessionState.status === 'RUNNING' && sessionState.targetTabId) {
-      // Check if tab still exists
+    if (sessionState.targetTabId) {
       try {
         const tab = await chrome.tabs.get(sessionState.targetTabId);
         if (!tab) {
           log('warn', 'Target tab was closed in background.');
           resetSession('IDLE');
+        } else if (isAutomationActive && !isLoopRunning) {
+          runAutomationLoop(sessionState.targetTabId);
         }
-      } catch (e) {
-        // Tab might be closed
-      }
+      } catch (e) {}
     }
   }
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (tabId === sessionState.targetTabId && changeInfo.status === 'complete') {
+    if (isAutomationActive && !isLoopRunning) {
+      runAutomationLoop(tabId);
+    }
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === sessionState.targetTabId) {
+    log('warn', 'Target tab closed. Resetting solver state.');
+    isAutomationActive = false;
+    isLoopRunning = false;
+    resetSession('IDLE');
+  }
+});
+
 async function hydrateConfig() {
-  const stored = await chrome.storage.local.get(['config', 'gemini_api_key', 'gemini_model']);
+  const stored = await chrome.storage.local.get(['config', 'gemini_api_key', 'gemini_model', 'active_session_state']);
   if (stored.config) {
     sessionState.config = { ...DEFAULT_CONFIG, ...stored.config };
   }
@@ -77,6 +94,15 @@ async function hydrateConfig() {
   }
   if (stored.gemini_model) {
     sessionState.config.model = stored.gemini_model;
+  }
+  if (stored.active_session_state) {
+    sessionState.targetTabId = stored.active_session_state.targetTabId || sessionState.targetTabId;
+    sessionState.targetTabInfo = stored.active_session_state.targetTabInfo || sessionState.targetTabInfo;
+    const s = stored.active_session_state.status;
+    if (s === 'RUNNING' || s === 'SCANNING' || s === 'SOLVING' || s === 'CLICKING' || s === 'SCROLLING') {
+      sessionState.status = s;
+      isAutomationActive = true;
+    }
   }
 }
 
@@ -94,6 +120,8 @@ function log(level, message, details = null) {
 }
 
 function broadcastState() {
+  chrome.storage.local.set({ active_session_state: sessionState }).catch(() => {});
+
   chrome.runtime.sendMessage({
     type: 'STATE_UPDATED',
     state: sessionState,
@@ -104,6 +132,15 @@ function broadcastState() {
       type: 'UPDATE_HUD',
       stats: sessionState.stats,
       status: sessionState.status,
+      currentQuestion: {
+        index: sessionState.stats.currentQuestionIndex,
+        text: sessionState.stats.currentQuestionText,
+        answer: sessionState.stats.currentAnswerText,
+        answerIndex: sessionState.stats.currentAnswerIndex,
+        confidence: sessionState.stats.currentConfidence,
+        rationale: sessionState.stats.currentRationale,
+        options: sessionState.stats.currentOptions || [],
+      },
     }).catch(() => {});
   }
 }
@@ -117,6 +154,11 @@ function resetSession(newStatus = 'IDLE') {
     failed: 0,
     currentQuestionIndex: 0,
     currentQuestionText: '',
+    currentAnswerText: '',
+    currentAnswerIndex: null,
+    currentOptions: [],
+    currentConfidence: null,
+    currentRationale: '',
     scrollProgress: 0,
     bottomReached: false,
     isComplete: newStatus === 'COMPLETED',
@@ -127,9 +169,9 @@ function resetSession(newStatus = 'IDLE') {
 }
 
 /**
- * Call Gemini 2.5/Flash API
+ * Call Gemini API for Multi-type Questions (Radio, Checkbox, Dropdown, Text)
  */
-async function askGemini(questionText, options, context = '') {
+async function askGemini(questionText, options = [], context = '', questionType = 'RADIO') {
   await hydrateConfig();
   const { apiKey, apiEndpoint, model } = sessionState.config;
 
@@ -141,20 +183,29 @@ async function askGemini(questionText, options, context = '') {
     throw new Error('Gemini API key is missing. Enter it in the extension popup or options.');
   }
 
-  const prompt = `You are an expert exam and quiz solver. Select the single most accurate and correct answer for this multiple-choice question.
+  const prompt = `You are an expert exam and quiz solver. Solve this question accurately.
 
+Question Type: ${questionType}
 Question:
 "${questionText}"
 
 ${context ? `Context:\n"${context}"\n` : ''}
-Options:
-${options.map((opt, i) => `${i + 1}. ${opt}`).join('\n')}
+${options && options.length > 0 ? `Options:\n${options.map((opt, i) => `${i + 1}. ${opt}`).join('\n')}` : ''}
+
+Instructions based on Question Type:
+- RADIO (single choice): return 0-based integer in "answer_index" and option text in "answer".
+- CHECKBOX (multiple choice): return array of 0-based integers in "answer_indices" and list in "answer".
+- DROPDOWN: return 0-based integer in "answer_index" and chosen option text in "answer".
+- TEXT (short answer/numeric): return exact filled string in "text_answer" and "answer".
 
 Respond ONLY with a valid JSON object in this exact schema:
 {
-  "answer_index": <0-based integer of correct option>,
-  "answer": "<exact option text of the correct choice>",
-  "confidence": <float between 0.0 and 1.0>,
+  "question_type": "${questionType.toLowerCase()}",
+  "answer_index": 0,
+  "answer_indices": [0],
+  "text_answer": "",
+  "answer": "<exact option text or text response>",
+  "confidence": 0.95,
   "rationale": "<concise 1-sentence explanation>"
 }`;
 
@@ -191,7 +242,11 @@ Respond ONLY with a valid JSON object in this exact schema:
 
   const parsed = JSON.parse(cleaned.trim());
 
-  if (typeof parsed.answer_index !== 'number' || parsed.answer_index < 0 || parsed.answer_index >= options.length) {
+  if (questionType === 'CHECKBOX' && !Array.isArray(parsed.answer_indices)) {
+    parsed.answer_indices = typeof parsed.answer_index === 'number' ? [parsed.answer_index] : [0];
+  }
+
+  if (typeof parsed.answer_index !== 'number' && options.length > 0) {
     if (parsed.answer) {
       const matchIdx = options.findIndex((opt) => opt.toLowerCase().includes(parsed.answer.toLowerCase()));
       parsed.answer_index = matchIdx >= 0 ? matchIdx : 0;
@@ -200,7 +255,6 @@ Respond ONLY with a valid JSON object in this exact schema:
     }
   }
 
-  parsed.answer = options[parsed.answer_index] || parsed.answer || '';
   return parsed;
 }
 
@@ -208,7 +262,7 @@ let isLoopRunning = false;
 let isAutomationActive = false;
 
 /**
- * Main Autonomous Automation Loop (Works in background even if user is in another tab!)
+ * Main Autonomous Automation Loop
  */
 async function runAutomationLoop(tabId) {
   if (isLoopRunning) {
@@ -222,14 +276,14 @@ async function runAutomationLoop(tabId) {
   broadcastState();
 
   let loopIterations = 0;
-  const MAX_ITERATIONS = 500;
+  const MAX_ITERATIONS = 1000;
 
   try {
     while (isAutomationActive && sessionState.status !== 'PAUSED' && sessionState.status !== 'COMPLETED' && sessionState.status !== 'IDLE' && loopIterations < MAX_ITERATIONS) {
       loopIterations++;
 
       try {
-        // 1. Verify target tab exists (even if backgrounded)
+        // --- 1. Verify tab is still alive ---
         try {
           const tab = await chrome.tabs.get(tabId);
           if (!tab) {
@@ -245,7 +299,7 @@ async function runAutomationLoop(tabId) {
           break;
         }
 
-        // 2. Scan DOM for questions & navigation
+        // --- 2. Scan the page fresh every iteration ---
         sessionState.status = 'SCANNING';
         broadcastState();
 
@@ -253,13 +307,9 @@ async function runAutomationLoop(tabId) {
         try {
           scanResult = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_PAGE' });
         } catch (e) {
-          // Re-inject content script if needed
           try {
-            await chrome.scripting.executeScript({
-              target: { tabId },
-              files: ['content.js'],
-            });
-            await new Promise((r) => setTimeout(r, 200));
+            await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+            await new Promise((r) => setTimeout(r, 300));
             scanResult = await chrome.tabs.sendMessage(tabId, { type: 'SCAN_PAGE' });
           } catch (injectErr) {
             log('error', `Script communication error: ${injectErr.message}`);
@@ -277,7 +327,7 @@ async function runAutomationLoop(tabId) {
 
         const scannedQuestions = scanResult.questions || [];
 
-        // Update question registry
+        // Register any new questions we haven't seen yet
         scannedQuestions.forEach((q) => {
           if (!sessionState.questions[q.id]) {
             sessionState.questions[q.id] = {
@@ -290,7 +340,7 @@ async function runAutomationLoop(tabId) {
               rationale: null,
               verified: q.isAnswered,
             };
-          } else if (q.isAnswered) {
+          } else if (q.isAnswered && !sessionState.questions[q.id].verified) {
             sessionState.questions[q.id].verified = true;
             sessionState.questions[q.id].status = 'VERIFIED';
           }
@@ -302,122 +352,166 @@ async function runAutomationLoop(tabId) {
         sessionState.stats.remaining = Math.max(0, sessionState.stats.detected - sessionState.stats.answered);
         sessionState.stats.scrollProgress = scanResult.scrollProgress || 0;
 
-        // If no questions detected on this scan, wait and retry scanning (NEVER click Next on empty scans)
         if (scannedQuestions.length === 0) {
           log('info', 'Scanning page for quiz questions and options...');
           await new Promise((r) => setTimeout(r, 1200));
           continue;
         }
 
-        // Find pending unanswered questions on the current screen/page
-        const pendingQuestions = scannedQuestions.filter(
+        // --- 3. Find the FIRST unanswered question on this page ---
+        const nextPending = scannedQuestions.find(
           (sq) => !sessionState.questions[sq.id]?.verified && (sessionState.questions[sq.id]?.retries || 0) < (sessionState.config.maxRetries || 3)
         );
 
-        // 3. Solve EVERY pending question on the screen first
-        if (pendingQuestions.length > 0) {
-          for (const rawQ of pendingQuestions) {
-            if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
+        if (nextPending) {
+          // Process exactly ONE question then loop back (re-scan for fresh DOM refs)
+          const question = sessionState.questions[nextPending.id];
+          if (!question || question.verified) {
+            await new Promise((r) => setTimeout(r, 400));
+            continue;
+          }
 
-            const question = sessionState.questions[rawQ.id];
-            if (!question || question.verified) continue;
+          const qNumber = question.questionNumber || (allQList.indexOf(question) + 1);
+          sessionState.status = 'SOLVING';
+          sessionState.stats.currentQuestionIndex = qNumber;
+          sessionState.stats.currentQuestionText = question.questionText;
+          sessionState.stats.currentOptions = question.options || [];
+          broadcastState();
 
-            sessionState.status = 'SOLVING';
-            sessionState.stats.currentQuestionIndex = question.questionNumber || allQList.indexOf(question) + 1;
-            sessionState.stats.currentQuestionText = question.questionText;
+          log('info', `[Q#${qNumber}/${scannedQuestions.length}] [${question.questionType || 'RADIO'}] Asking Gemini: "${question.questionText.substring(0, 60)}..."`);
+
+          // --- 4. Ask Gemini ---
+          let geminiResult;
+          try {
+            geminiResult = await askGemini(question.questionText, question.options, question.context, question.questionType || 'RADIO');
+          } catch (apiErr) {
+            log('error', `Gemini API error on Q#${qNumber}: ${apiErr.message}`);
+            question.status = 'FAILED';
+            question.retries = (question.retries || 0) + 1;
             broadcastState();
-
-            log('info', `[Question #${sessionState.stats.currentQuestionIndex}] Consulting Gemini AI: "${question.questionText.substring(0, 55)}..."`);
-
-            let geminiResult;
-            try {
-              geminiResult = await askGemini(question.questionText, question.options, question.context);
-            } catch (apiErr) {
-              log('error', `Gemini API query error: ${apiErr.message}`);
-              question.status = 'FAILED';
-              question.retries = (question.retries || 0) + 1;
+            if (apiErr.message.includes('missing') || apiErr.message.includes('API key')) {
+              isAutomationActive = false;
+              sessionState.status = 'PAUSED';
               broadcastState();
-              if (apiErr.message.includes('missing') || apiErr.message.includes('API key')) {
-                isAutomationActive = false;
-                sessionState.status = 'PAUSED';
-                broadcastState();
-                return;
-              }
-              continue;
+              return;
             }
+            await new Promise((r) => setTimeout(r, 800));
+            continue;
+          }
 
-            if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
+          if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
 
-            question.selectedOptionIndex = geminiResult.answer_index;
-            question.selectedOptionText = geminiResult.answer;
-            question.confidence = geminiResult.confidence;
-            question.rationale = geminiResult.rationale;
+          question.selectedOptionIndex = geminiResult.answer_index;
+          question.selectedOptionText = geminiResult.text_answer || geminiResult.answer;
+          question.confidence = geminiResult.confidence;
+          question.rationale = geminiResult.rationale;
 
-            sessionState.status = 'CLICKING';
-            broadcastState();
+          sessionState.stats.currentAnswerText = geminiResult.text_answer || geminiResult.answer;
+          sessionState.stats.currentAnswerIndex = typeof geminiResult.answer_index === 'number' ? geminiResult.answer_index : null;
+          sessionState.stats.currentConfidence = geminiResult.confidence;
+          sessionState.stats.currentRationale = geminiResult.rationale;
+          sessionState.stats.currentOptions = question.options || [];
 
-            // Send click command with BOTH index and exact text
-            const clickRes = await chrome.tabs.sendMessage(tabId, {
+          log('info', `[Q#${qNumber}] Gemini says: "${geminiResult.text_answer || geminiResult.answer}" (${Math.round((geminiResult.confidence || 0.95) * 100)}% confident)`);
+
+          // --- 5. Click the answer ---
+          sessionState.status = 'CLICKING';
+          broadcastState();
+
+          let clickResult;
+          try {
+            clickResult = await chrome.tabs.sendMessage(tabId, {
               type: 'CLICK_ANSWER',
               questionId: question.id,
+              questionType: question.questionType,
               optionIndex: geminiResult.answer_index,
+              optionIndices: geminiResult.answer_indices,
               optionText: geminiResult.answer,
+              textAnswer: geminiResult.text_answer || geminiResult.answer,
               delayMs: sessionState.config.clickDelayMs,
             });
+          } catch (clickErr) {
+            log('error', `Click failed on Q#${qNumber}: ${clickErr.message}`);
+            question.retries = (question.retries || 0) + 1;
+            await new Promise((r) => setTimeout(r, 600));
+            continue; // Re-scan and retry this question
+          }
 
-            sessionState.status = 'VERIFYING';
-            broadcastState();
+          if (!clickResult?.success) {
+            log('warn', `[Q#${qNumber}] Click returned failure: ${clickResult?.error || 'unknown'}. Retrying...`);
+            question.retries = (question.retries || 0) + 1;
+            await new Promise((r) => setTimeout(r, 600));
+            continue; // Re-scan and retry
+          }
 
+          // --- 6. Wait a moment for DOM to settle, then verify ---
+          await new Promise((r) => setTimeout(r, sessionState.config.clickDelayMs || 500));
+
+          sessionState.status = 'VERIFYING';
+          broadcastState();
+
+          try {
             await chrome.tabs.sendMessage(tabId, {
               type: 'VERIFY_CLICK',
               questionId: question.id,
               optionIndex: geminiResult.answer_index,
               optionText: geminiResult.answer,
             });
-
-            question.status = 'VERIFIED';
-            question.verified = true;
-            sessionState.stats.answered += 1;
-            sessionState.stats.remaining = Math.max(0, sessionState.stats.remaining - 1);
-            log('success', `✔ [Question #${sessionState.stats.currentQuestionIndex}] Answer Selected: "${geminiResult.answer}" (${(geminiResult.confidence * 100).toFixed(0)}% confidence)`);
-
-            broadcastState();
-            await new Promise((r) => setTimeout(r, sessionState.config.clickDelayMs || 500));
+          } catch (e) {
+            // Verification failure is non-fatal; proceed
           }
+
+          // --- 7. Mark as answered and loop back to re-scan ---
+          question.status = 'VERIFIED';
+          question.verified = true;
+          sessionState.stats.answered = allQList.filter((q) => q.verified).length + 1;
+          sessionState.stats.remaining = Math.max(0, (sessionState.stats.detected || scannedQuestions.length) - sessionState.stats.answered);
+
+          log('success', `✔ [Q#${qNumber}] Answered: "${geminiResult.text_answer || geminiResult.answer}" (${Math.round((geminiResult.confidence || 0.95) * 100)}% confidence)`);
+
+          broadcastState();
+          // Short pause before re-scanning for the next question
+          await new Promise((r) => setTimeout(r, sessionState.config.clickDelayMs || 500));
+          continue; // ← Go back to top: re-scan page and pick next pending question
         }
 
-        if (!isAutomationActive || sessionState.status === 'PAUSED' || sessionState.status === 'IDLE') break;
-
-        // Verify if ALL scanned questions on this page are now answered before allowing any movement
-        const allPageQuestionsAnswered = scannedQuestions.every(
-          (sq) => sq.isAnswered || sessionState.questions[sq.id]?.verified
-        );
+        // --- 8. All visible questions answered — check whether to advance ---
+        const allPageQuestionsAnswered = scannedQuestions.every((sq) => {
+          const stored = sessionState.questions[sq.id];
+          return (
+            sq.isAnswered ||
+            stored?.verified ||
+            stored?.status === 'FAILED' ||
+            (stored?.retries || 0) >= (sessionState.config.maxRetries || 3)
+          );
+        });
 
         if (!allPageQuestionsAnswered) {
-          log('info', 'Awaiting full question completion on current page before advancing...');
+          log('info', 'Waiting for all questions on this page to be completed...');
           await new Promise((r) => setTimeout(r, 800));
           continue;
         }
 
-        // 4. NAVIGATION / PAGINATION LOGIC:
-        // Only click Next › when all questions on this page have been answered!
+        // --- 9. Advance to next page if available ---
         if (scanResult?.hasNextPage) {
-          log('info', 'All questions on current page answered. Clicking "Next ›" to advance...');
+          log('info', `All ${sessionState.stats.answered} questions answered. Clicking "Next" to advance...`);
           sessionState.status = 'SCROLLING';
           broadcastState();
 
           const nextRes = await chrome.tabs.sendMessage(tabId, { type: 'CLICK_NEXT_PAGE' });
           if (nextRes?.clicked) {
-            await new Promise((r) => setTimeout(r, 1500));
+            await new Promise((r) => setTimeout(r, 1800));
+            // Reset question map so fresh IDs are registered for new page
+            sessionState.questions = {};
             continue;
           }
         }
 
-        // If NO Next button exists and bottom is not reached, scroll down to reveal subsequent questions
+        // --- 10. Scroll down if there might be more questions below ---
         if (!scanResult?.hasNextPage && !scanResult?.bottomReached) {
           sessionState.status = 'SCROLLING';
           broadcastState();
-          log('info', 'Visible questions answered. Scrolling down to reveal more...');
+          log('info', 'Scrolling down to reveal more questions...');
 
           const scrollResponse = await chrome.tabs.sendMessage(tabId, {
             type: 'SCROLL_STEP',
@@ -429,15 +523,13 @@ async function runAutomationLoop(tabId) {
           continue;
         }
 
-        // 5. COMPLETION & AUTO-SUBMIT LOGIC:
-        // If bottom reached OR submit button present
+        // --- 11. Bottom reached or submit available ---
         if (scanResult?.bottomReached || scanResult?.hasSubmit) {
-          // If submit button is present and autoSubmit is enabled
           if (sessionState.config.autoSubmit && scanResult?.hasSubmit) {
             sessionState.status = 'SUBMITTING';
             sessionState.stats.submissionStatus = 'SUBMITTING';
             broadcastState();
-            log('info', 'All questions answered! Locating and submitting final quiz results...');
+            log('info', 'All questions answered! Submitting quiz...');
 
             const submitResult = await chrome.tabs.sendMessage(tabId, { type: 'PERFORM_SUBMIT' });
             if (submitResult && submitResult.submitted) {
@@ -454,7 +546,6 @@ async function runAutomationLoop(tabId) {
             }
           }
 
-          // If at least 1 question was detected and answered
           if (sessionState.stats.answered > 0) {
             isAutomationActive = false;
             sessionState.status = 'COMPLETED';
@@ -470,7 +561,7 @@ async function runAutomationLoop(tabId) {
           }
         }
       } catch (loopErr) {
-        log('error', `Automation step: ${loopErr.message}`);
+        log('error', `Automation step error: ${loopErr.message}`);
         await new Promise((r) => setTimeout(r, 1500));
       }
     }
@@ -479,7 +570,6 @@ async function runAutomationLoop(tabId) {
   }
 }
 
-// Message Dispatcher
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const { type, payload } = message;
 
@@ -491,7 +581,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'UPDATE_CONFIG':
       if (payload) {
         sessionState.config = { ...sessionState.config, ...payload };
-        // Persistent storage update
         chrome.storage.local.set({
           config: sessionState.config,
           gemini_api_key: sessionState.config.apiKey || '',

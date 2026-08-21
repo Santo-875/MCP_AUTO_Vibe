@@ -7,8 +7,14 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+let filenameStr = '';
+try {
+  filenameStr = fileURLToPath(import.meta.url);
+} catch (e) {
+  filenameStr = typeof __filename !== 'undefined' ? __filename : '';
+}
+const __filenamePath = filenameStr;
+const __dirnamePath = path.dirname(__filenamePath || process.cwd());
 
 async function startServer() {
   const app = express();
@@ -16,7 +22,6 @@ async function startServer() {
 
   app.use(express.json({ limit: '10mb' }));
 
-  // Initialize Gemini SDK with User-Agent telemetry
   const ai = new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY,
     httpOptions: {
@@ -26,7 +31,6 @@ async function startServer() {
     },
   });
 
-  // Health check endpoint
   app.get('/api/health', (req, res) => {
     res.json({
       status: 'ok',
@@ -35,18 +39,16 @@ async function startServer() {
     });
   });
 
-  // Core Gemini MCQ Solver API Endpoint (used by both web testbench and extension)
   app.post('/api/gemini/solve', async (req, res) => {
     try {
-      const { question, options, context, customApiKey, modelName } = req.body;
+      const { question, options = [], context, customApiKey, modelName, questionType = 'RADIO' } = req.body;
 
-      if (!question || !Array.isArray(options) || options.length === 0) {
+      if (!question) {
         return res.status(400).json({
-          error: 'Invalid request: "question" string and non-empty "options" array are required.',
+          error: 'Invalid request: "question" string is required.',
         });
       }
 
-      // If a custom API key was provided by extension settings, use it, else use server key
       const client = customApiKey
         ? new GoogleGenAI({
             apiKey: customApiKey,
@@ -58,40 +60,39 @@ async function startServer() {
 
       const model = modelName || 'gemini-3.7-flash';
 
-      const prompt = `You are an expert AI quiz and exam solver. Your task is to select the single most accurate, correct answer for the provided Multiple Choice Question (MCQ).
+      const prompt = `You are an expert AI quiz and exam solver. Your task is to accurately solve this question.
 
+Question Type: ${questionType}
 QUESTION:
 ${question}
 
-OPTIONS:
-${options.map((opt: string, idx: number) => `[Index ${idx}] ${opt}`).join('\n')}
+${options && options.length > 0 ? `OPTIONS:\n${options.map((opt: string, idx: number) => `[Index ${idx}] ${opt}`).join('\n')}` : ''}
 
 ${context ? `ADDITIONAL PAGE CONTEXT:\n${context}\n` : ''}
 
 Instructions:
-1. Carefully analyze the question and all options.
-2. Select the index (0-based) of the most accurate answer.
-3. Provide the exact text of the chosen answer option.
-4. Estimate your confidence level from 0.0 to 1.0.
-5. Provide a brief 1-sentence rationale.`;
+1. Identify the single best option or text answer based on Question Type (${questionType}).
+2. Provide the exact text of the answer.
+3. Estimate your confidence level from 0.0 to 1.0.
+4. Provide a brief 1-sentence rationale.`;
 
       const response = await client.models.generateContent({
         model: model,
         contents: prompt,
         config: {
           systemInstruction:
-            'You are an authoritative MCQ and quiz solver. Always return valid structured JSON adhering strictly to the requested schema. Ensure answer_index is a valid 0-based integer pointing to the chosen option.',
+            'You are an authoritative MCQ and quiz solver. Always return valid structured JSON adhering strictly to the requested schema.',
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
             properties: {
               answer_index: {
                 type: Type.INTEGER,
-                description: 'The 0-based index of the correct option in the supplied options array.',
+                description: 'The 0-based index of the correct option if options exist.',
               },
               answer: {
                 type: Type.STRING,
-                description: 'The exact text string of the selected answer option.',
+                description: 'The exact text string of the selected answer option or filled response.',
               },
               confidence: {
                 type: Type.NUMBER,
@@ -102,7 +103,7 @@ Instructions:
                 description: 'A brief explanation of why this answer is correct.',
               },
             },
-            required: ['answer_index', 'answer', 'confidence'],
+            required: ['answer', 'confidence'],
           },
         },
       });
@@ -112,7 +113,6 @@ Instructions:
       try {
         parsed = JSON.parse(responseText.trim());
       } catch (parseErr) {
-        // Fallback extraction if JSON had formatting
         const match = responseText.match(/\{[\s\S]*\}/);
         if (match) {
           parsed = JSON.parse(match[0]);
@@ -121,24 +121,23 @@ Instructions:
         }
       }
 
-      // Validate answer_index boundary
       if (
-        typeof parsed.answer_index !== 'number' ||
-        parsed.answer_index < 0 ||
-        parsed.answer_index >= options.length
+        options && options.length > 0 &&
+        (typeof parsed.answer_index !== 'number' ||
+          parsed.answer_index < 0 ||
+          parsed.answer_index >= options.length)
       ) {
-        // Safe fallback: match by string or default to 0
         const matchedIdx = options.findIndex((opt: string) =>
           parsed.answer ? opt.toLowerCase().includes(parsed.answer.toLowerCase()) : false
         );
         parsed.answer_index = matchedIdx >= 0 ? matchedIdx : 0;
-        parsed.answer = options[parsed.answer_index];
+        parsed.answer = options[parsed.answer_index] || parsed.answer;
       }
 
       return res.json({
         success: true,
-        answer_index: parsed.answer_index,
-        answer: parsed.answer || options[parsed.answer_index],
+        answer_index: parsed.answer_index ?? 0,
+        answer: parsed.answer,
         confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.95,
         rationale: parsed.rationale || 'Selected based on domain knowledge.',
         modelUsed: model,
@@ -152,7 +151,6 @@ Instructions:
     }
   });
 
-  // Vite middleware setup
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

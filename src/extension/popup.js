@@ -1,126 +1,183 @@
 /**
- * Gemini Auto MCQ Solver - Popup Controller (Manifest V3)
+ * Gemini Auto MCQ Solver - Popup Controller
  */
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // DOM Elements
-  const tabTitle = document.getElementById('tabTitle');
-  const statusPill = document.getElementById('statusPill');
-  const statusText = document.getElementById('statusText');
+  const targetTabTitle = document.getElementById('targetTabTitle');
+  const statusBadge = document.getElementById('statusBadge');
+  const progressBar = document.getElementById('progressBar');
   const statDetected = document.getElementById('statDetected');
   const statAnswered = document.getElementById('statAnswered');
   const statRemaining = document.getElementById('statRemaining');
-  const currentQuestionText = document.getElementById('currentQuestionText');
-  const currentQuestionTag = document.getElementById('currentQuestionTag');
-  const confidenceTag = document.getElementById('confidenceTag');
-
+  const activeQuestionCard = document.getElementById('activeQuestionCard');
+  const activeQuestionText = document.getElementById('activeQuestionText');
   const btnStart = document.getElementById('btnStart');
-  const activeControls = document.getElementById('activeControls');
+  const runningControls = document.getElementById('runningControls');
   const btnPause = document.getElementById('btnPause');
-  const btnResume = document.getElementById('btnResume');
   const btnStop = document.getElementById('btnStop');
-
   const toggleAutoSubmit = document.getElementById('toggleAutoSubmit');
-  const toggleHud = document.getElementById('toggleHud');
-  const logsList = document.getElementById('logsList');
-  const btnClearLogs = document.getElementById('btnClearLogs');
+  const logStream = document.getElementById('logStream');
+  const btnOptions = document.getElementById('btnOptions');
+  const modelBadge = document.getElementById('modelBadge');
 
-  // Load current active tab info for preview
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (tabs && tabs[0]) {
-      tabTitle.innerText = tabs[0].title || 'Active Tab';
-    }
+  const keyMissingAlert = document.getElementById('keyMissingAlert');
+  const keyConnectedBar = document.getElementById('keyConnectedBar');
+  const inputApiKey = document.getElementById('inputApiKey');
+  const btnSaveKey = document.getElementById('btnSaveKey');
+
+  btnOptions.addEventListener('click', () => {
+    chrome.runtime.openOptionsPage();
   });
 
-  // Fetch initial background state
-  chrome.runtime.sendMessage({ type: 'GET_STATE' }, (response) => {
-    if (response && response.state) {
-      renderState(response.state);
-    }
+  // Persistent storage key loader
+  const storedData = await chrome.storage.local.get(['gemini_api_key', 'config']);
+  const savedKey = storedData.gemini_api_key || storedData.config?.apiKey || '';
+  if (savedKey) {
+    inputApiKey.value = savedKey;
+    keyMissingAlert.style.display = 'none';
+    keyConnectedBar.style.display = 'flex';
+  }
+
+  btnSaveKey.addEventListener('click', async () => {
+    const keyVal = inputApiKey.value.trim();
+    if (!keyVal) return;
+    await chrome.storage.local.set({ gemini_api_key: keyVal });
+    await chrome.runtime.sendMessage({
+      type: 'UPDATE_CONFIG',
+      payload: { apiKey: keyVal },
+    });
+    keyMissingAlert.style.display = 'none';
+    keyConnectedBar.style.display = 'flex';
   });
 
-  // Listen for state broadcast updates from background worker
+  const response = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+  if (response && response.state) {
+    if (savedKey && !response.state.config.apiKey) {
+      response.state.config.apiKey = savedKey;
+    }
+    updateUI(response.state);
+  }
+
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (activeTab && (!response?.state?.targetTabId || response.state.status === 'IDLE')) {
+    targetTabTitle.textContent = activeTab.title || 'Current Tab';
+  }
+
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'STATE_UPDATED' && message.state) {
-      renderState(message.state);
+      updateUI(message.state);
     }
   });
 
-  // Render State
-  function renderState(state) {
-    if (!state) return;
-
-    // Status Pill
-    statusText.innerText = state.status;
-    statusPill.className = 'status-pill';
-    if (state.status === 'RUNNING' || state.status === 'SCANNING' || state.status === 'SOLVING' || state.status === 'CLICKING' || state.status === 'VERIFYING' || state.status === 'SCROLLING' || state.status === 'SUBMITTING') {
-      statusPill.classList.add('status-running');
-    } else if (state.status === 'PAUSED' || state.status === 'PAUSED_CAPTCHA') {
-      statusPill.classList.add('status-paused');
-      statusText.innerText = state.status === 'PAUSED_CAPTCHA' ? 'CAPTCHA PAUSE' : 'PAUSED';
-    } else if (state.status === 'COMPLETED') {
-      statusPill.classList.add('status-completed');
+  btnStart.addEventListener('click', async () => {
+    const stored = await chrome.storage.local.get(['gemini_api_key', 'config']);
+    const hasKey = stored.gemini_api_key || stored.config?.apiKey;
+    if (!hasKey) {
+      keyMissingAlert.style.display = 'flex';
+      inputApiKey.focus();
+      return;
     }
 
-    // Stats
-    statDetected.innerText = state.stats.detected || 0;
-    statAnswered.innerText = state.stats.answered || 0;
-    statRemaining.innerText = state.stats.remaining || 0;
+    btnStart.disabled = true;
+    btnStart.textContent = 'Starting...';
+    await chrome.runtime.sendMessage({ type: 'START_AUTOMATION' });
+  });
 
-    // Current Task
-    if (state.stats.currentQuestionText) {
-      currentQuestionTag.innerText = `QUESTION #${state.stats.currentQuestionIndex || 1}`;
-      currentQuestionText.innerText = state.stats.currentQuestionText;
-    } else if (state.status === 'COMPLETED') {
-      currentQuestionTag.innerText = 'STATUS';
-      currentQuestionText.innerText = 'All questions solved! ' + (state.stats.submissionMessage || 'Ready.');
+  btnPause.addEventListener('click', async () => {
+    const res = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+    if (res?.state?.status === 'PAUSED' || res?.state?.status === 'PAUSED_CAPTCHA') {
+      await chrome.runtime.sendMessage({ type: 'RESUME_AUTOMATION' });
     } else {
-      currentQuestionTag.innerText = 'STATUS';
-      currentQuestionText.innerText = state.status === 'IDLE' ? 'Ready to solve questions on active tab.' : `Status: ${state.status}`;
+      await chrome.runtime.sendMessage({ type: 'PAUSE_AUTOMATION' });
     }
+  });
 
-    // Confidence
-    const qList = Object.values(state.questions || {});
-    const lastAnswered = qList.filter((q) => q.confidence).pop();
-    if (lastAnswered && lastAnswered.confidence) {
-      confidenceTag.innerText = `Confidence: ${(lastAnswered.confidence * 100).toFixed(0)}%`;
+  btnStop.addEventListener('click', async () => {
+    await chrome.runtime.sendMessage({ type: 'STOP_AUTOMATION' });
+  });
+
+  toggleAutoSubmit.addEventListener('change', async (e) => {
+    await chrome.runtime.sendMessage({
+      type: 'UPDATE_CONFIG',
+      payload: { autoSubmit: e.target.checked },
+    });
+  });
+
+  function updateUI(state) {
+    const { status, stats, targetTabInfo, logs, config } = state;
+
+    const hasKey = !!(config?.apiKey || inputApiKey.value.trim());
+    if (!hasKey) {
+      keyMissingAlert.style.display = 'flex';
+      keyConnectedBar.style.display = 'none';
     } else {
-      confidenceTag.innerText = 'Confidence: --';
+      keyMissingAlert.style.display = 'none';
+      keyConnectedBar.style.display = 'flex';
     }
 
-    // Controls Visibility
-    const isRunning = state.status !== 'IDLE' && state.status !== 'COMPLETED';
-    btnStart.style.display = isRunning ? 'none' : 'flex';
-    activeControls.style.display = isRunning ? 'grid' : 'none';
+    if (config?.model) {
+      modelBadge.textContent = config.model;
+    }
+    if (config?.autoSubmit !== undefined) {
+      toggleAutoSubmit.checked = config.autoSubmit;
+    }
 
-    if (state.status === 'PAUSED' || state.status === 'PAUSED_CAPTCHA') {
-      btnPause.style.display = 'none';
-      btnResume.style.display = 'flex';
+    if (targetTabInfo) {
+      targetTabTitle.textContent = targetTabInfo.title;
+    }
+
+    statusBadge.textContent = status;
+    statusBadge.className = 'status-badge';
+    if (status === 'IDLE') statusBadge.classList.add('status-idle');
+    else if (status === 'COMPLETED') statusBadge.classList.add('status-completed');
+    else if (status.includes('PAUSED')) statusBadge.classList.add('status-paused');
+    else statusBadge.classList.add('status-running');
+
+    statDetected.textContent = stats.detected;
+    statAnswered.textContent = stats.answered;
+    statRemaining.textContent = stats.remaining;
+
+    const percent = stats.detected > 0 ? Math.round((stats.answered / stats.detected) * 100) : 0;
+    progressBar.style.width = `${percent}%`;
+
+    if (stats.currentQuestionText && status !== 'IDLE' && status !== 'COMPLETED') {
+      activeQuestionCard.style.display = 'block';
+      activeQuestionText.textContent = stats.currentQuestionText;
     } else {
-      btnPause.style.display = 'flex';
-      btnResume.style.display = 'none';
+      activeQuestionCard.style.display = 'none';
     }
 
-    // Config Toggles
-    if (state.config) {
-      toggleAutoSubmit.checked = state.config.autoSubmit !== false;
-      toggleHud.checked = state.config.showOverlayHud !== false;
+    const isRunning =
+      status === 'RUNNING' ||
+      status === 'SCANNING' ||
+      status === 'SOLVING' ||
+      status === 'CLICKING' ||
+      status === 'VERIFYING' ||
+      status === 'SCROLLING' ||
+      status === 'SUBMITTING';
+    const isPaused = status === 'PAUSED' || status === 'PAUSED_CAPTCHA';
+
+    if (isRunning || isPaused) {
+      btnStart.style.display = 'none';
+      runningControls.style.display = 'grid';
+      btnPause.querySelector('span').textContent = isPaused ? '▶ Resume' : '⏸ Pause';
+    } else {
+      btnStart.style.display = 'flex';
+      btnStart.disabled = false;
+      btnStart.textContent = '🚀 Start Auto Solver';
+      runningControls.style.display = 'none';
     }
 
-    // Target Tab Card
-    if (state.targetTabInfo) {
-      tabTitle.innerText = state.targetTabInfo.title || `Tab #${state.targetTabInfo.id}`;
-    }
-
-    // Render Logs
-    if (state.logs && state.logs.length > 0) {
-      logsList.innerHTML = state.logs
+    // Render Logs Stream
+    if (logs && logs.length > 0) {
+      logStream.innerHTML = logs
         .slice(0, 30)
         .map(
-          (log) => `
-          <div class="log-item ${log.level}">
-            <span class="time">${log.timestamp}</span>
-            <span class="msg">${escapeHtml(log.message)}</span>
+          (l) => `
+          <div class="log-item">
+            <span class="log-time">${l.timestamp}</span>
+            <span class="log-badge ${l.level}">${l.level}</span>
+            <span class="log-msg">${escapeHtml(l.message)}</span>
           </div>
         `
         )
@@ -128,48 +185,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.innerText = text || '';
-    return div.innerHTML;
+  function escapeHtml(str) {
+    return (str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
   }
-
-  // Button Actions
-  btnStart.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'START_AUTOMATION' }, (res) => {
-      if (res && res.error) {
-        alert(res.error);
-      }
-    });
-  });
-
-  btnPause.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'PAUSE_AUTOMATION' });
-  });
-
-  btnResume.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'RESUME_AUTOMATION' });
-  });
-
-  btnStop.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'STOP_AUTOMATION' });
-  });
-
-  toggleAutoSubmit.addEventListener('change', (e) => {
-    chrome.runtime.sendMessage({
-      type: 'UPDATE_CONFIG',
-      payload: { autoSubmit: e.target.checked },
-    });
-  });
-
-  toggleHud.addEventListener('change', (e) => {
-    chrome.runtime.sendMessage({
-      type: 'UPDATE_CONFIG',
-      payload: { showOverlayHud: e.target.checked },
-    });
-  });
-
-  btnClearLogs.addEventListener('click', () => {
-    logsList.innerHTML = '<div class="log-item info"><span class="time">--:--</span><span class="msg">Logs cleared.</span></div>';
-  });
 });

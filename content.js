@@ -1,6 +1,7 @@
 /**
  * Gemini Auto MCQ & Quiz Solver - Content Script Agent
- * Autonomous DOM detection, robust click execution, Prev/Next disambiguation, background tab support, and pagination engine.
+ * Autonomous DOM detection, robust multi-type answer filling (Radio, Checkbox, Dropdown, Text Input),
+ * Next/Page navigation engine, and auto-submission handling.
  */
 
 (() => {
@@ -26,34 +27,19 @@
       '.test-question',
       '.exam-question',
       '.card:has(input[type="radio"])',
+      '.card:has(input[type="checkbox"])',
+      '.card:has(select)',
       '[data-question-id]',
       '[id*="question"]',
       '[class*="question"]',
       'div:has(input[type="radio"])',
       'div:has(input[type="checkbox"])',
+      'div:has(select)',
+      'div:has(textarea)',
       'div:has([role="radio"])',
       'div:has([role="option"])',
       'li:has(input[type="radio"])',
       'section:has(input[type="radio"])',
-    ],
-    options: [
-      'input[type="radio"]',
-      'input[type="checkbox"]',
-      '[role="radio"]',
-      '[role="option"]',
-      '[role="checkbox"]',
-      'label:has(input)',
-      'label',
-      '.choice',
-      '.answer',
-      '.option',
-      '.answer-option',
-      '.quiz-option',
-      '.test-option',
-      '[data-value]',
-      'button[role="radio"]',
-      'button:not([type="submit"]):not([data-action="next"]):not([data-action="prev"])',
-      'div[tabindex="0"]',
     ],
     nextButtons: [
       'button[data-action="next"]',
@@ -63,10 +49,20 @@
       '.next-page-btn',
       '.pagination-next',
       'a.next',
+      'input[name="next"]',
       'input[value*="Next" i]',
       'input[value*="Continue" i]',
+      'input[value*="Save & Next" i]',
       'div[role="button"][jsname="OCpkoe"]',
+      'div[role="button"].N2B65e',
       '.freebirdFormviewerViewNavigationNextButton',
+      'button[id*="next"]',
+      'a[id*="next"]',
+      'button[class*="next"]',
+      'a[class*="next"]',
+      '.mod_quiz-next-nav',
+      '#question-next-btn',
+      '.btn-next-question',
     ],
     submitButtons: [
       'button[type="submit"]',
@@ -80,6 +76,10 @@
       'input[value*="Submit" i]',
       'input[value*="Finish" i]',
       'input[value*="Complete" i]',
+      'div[role="button"][jsname="M2v1dh"]',
+      '.freebirdFormviewerViewNavigationSubmitButton',
+      'button[id*="submit"]',
+      'button[class*="submit"]',
     ],
     captcha: [
       '#cf-challenge-running',
@@ -89,26 +89,30 @@
 
   let overlayHudElement = null;
 
-  function createOrUpdateHud(stats, status) {
+  function createOrUpdateHud(stats, status, currentQuestion) {
     if (!overlayHudElement) {
       overlayHudElement = document.createElement('div');
       overlayHudElement.id = 'gemini-mcq-solver-hud';
       overlayHudElement.style.cssText = `
         position: fixed;
-        bottom: 24px;
-        right: 24px;
+        bottom: 20px;
+        right: 20px;
         z-index: 2147483647;
-        background: #1e1b4b;
+        background: #0f172a;
         color: #ffffff;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         font-size: 12px;
-        padding: 12px 16px;
-        border-radius: 12px;
-        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
-        border: 1px solid #4338ca;
+        padding: 14px 16px;
+        border-radius: 14px;
+        box-shadow: 0 12px 35px -5px rgba(0,0,0,0.6), 0 0 0 1px #6366f1;
+        border: 1.5px solid #6366f1;
         display: flex;
-        align-items: center;
-        gap: 12px;
+        flex-direction: column;
+        gap: 10px;
+        min-width: 260px;
+        max-width: 360px;
+        max-height: 80vh;
+        overflow-y: auto;
         pointer-events: auto;
         user-select: none;
         transition: all 0.3s ease;
@@ -116,17 +120,57 @@
       document.body.appendChild(overlayHudElement);
     }
 
+    const qIdx = currentQuestion?.index || stats?.currentQuestionIndex || 0;
+    const qNum = qIdx ? `Q#${qIdx}` : '';
+    const answerText = currentQuestion?.answer || stats?.currentAnswerText || '';
+    const confVal = currentQuestion?.confidence || stats?.currentConfidence;
+    const confidencePct = confVal ? `${Math.round(confVal * 100)}%` : '';
+    const options = currentQuestion?.options || [];
+    const answerIdx = currentQuestion?.answerIndex;
+
+    // Build options list HTML
+    let optionsHtml = '';
+    if (options.length > 0) {
+      optionsHtml = `
+        <div style="background: #0c1a2e; border: 1px solid #334155; border-radius: 8px; padding: 8px 10px;">
+          <div style="font-size: 10px; font-weight: 700; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px;">Options</div>
+          ${options.map((opt, i) => {
+            const isCorrect = (answerText && (cleanText(opt).toLowerCase() === cleanText(answerText).toLowerCase() || cleanText(answerText).toLowerCase().includes(cleanText(opt).toLowerCase()))) || (typeof answerIdx === 'number' && answerIdx === i);
+            return `<div style="display:flex; align-items:flex-start; gap:6px; padding:3px 0; border-bottom: 1px solid #1e293b;">
+              <span style="min-width:18px; font-size:11px; font-weight:700; color:${isCorrect ? '#34d399' : '#64748b'};">${String.fromCharCode(65 + i)}.</span>
+              <span style="font-size:12px; word-break:break-word; color:${isCorrect ? '#86efac' : '#cbd5e1'}; font-weight:${isCorrect ? '700' : '400'};">
+                ${isCorrect ? '✔ ' : ''}${escapeHtml(opt)}
+              </span>
+            </div>`;
+          }).join('')}
+        </div>
+      `;
+    }
+
     overlayHudElement.innerHTML = `
-      <div style="width: 8px; height: 8px; border-radius: 50%; background: #6366f1; animation: pulse 1.5s infinite;"></div>
-      <div>
-        <div style="font-weight: bold; font-size: 11px; color: #a5b4fc; text-transform: uppercase; letter-spacing: 0.5px;">Gemini Solver</div>
-        <div style="font-size: 13px; font-weight: 600; color: #ffffff;">${status || 'Active'}</div>
+      <div style="display:flex; align-items:center; justify-content:space-between; width:100%; gap:10px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <div style="width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;"></div>
+          <span style="font-weight:800;font-size:11px;color:#a5b4fc;text-transform:uppercase;letter-spacing:0.6px;">Gemini AI Solver</span>
+        </div>
+        <span style="font-size:11px;font-weight:700;background:#312e81;color:#c7d2fe;padding:2px 8px;border-radius:9999px;border:1px solid #4338ca;">
+          ${stats?.answered || 0}/${stats?.detected || 0} Done
+        </span>
       </div>
-      <div style="height: 24px; width: 1px; background: #4338ca; margin: 0 4px;"></div>
-      <div style="text-align: right;">
-        <div style="font-size: 10px; color: #94a3b8;">Answered</div>
-        <div style="font-size: 13px; font-weight: bold; color: #34d399;">${stats?.answered || 0} / ${stats?.detected || 0}</div>
+
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+        <div style="font-size:13px;font-weight:700;color:#38bdf8;">${qNum ? `${qNum} — ` : ''}${status || 'Active'}</div>
+        ${confidencePct ? `<div style="font-size:10px;font-weight:700;color:#34d399;background:#064e3b;padding:2px 6px;border-radius:4px;">${confidencePct}</div>` : ''}
       </div>
+
+      ${optionsHtml}
+
+      ${answerText && options.length === 0 ? `
+        <div style="background:#1e1b4b;border:1px solid #4f46e5;border-radius:8px;padding:8px 10px;">
+          <div style="font-size:10px;font-weight:700;color:#a5b4fc;text-transform:uppercase;margin-bottom:2px;">Correct Answer</div>
+          <div style="font-size:13px;font-weight:700;color:#34d399;word-break:break-word;">✔ &quot;${escapeHtml(answerText)}&quot;</div>
+        </div>
+      ` : ''}
     `;
   }
 
@@ -138,7 +182,6 @@
   }
 
   function checkForCaptcha() {
-    // Only detect if an active visible modal challenge is present
     const blockingSelectors = [
       '#cf-challenge-running',
       '#challenge-running',
@@ -171,12 +214,28 @@
   }
 
   function isVisibleElement(el) {
-    if (!el) return false;
-    if (el.checkVisibility && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) {
-      // In background tabs, checkVisibility can return false due to page throttling, so check DOM attached
-      return document.body.contains(el);
+    if (!el || !el.ownerDocument || !el.ownerDocument.body.contains(el)) return false;
+    if (el.nodeType !== Node.ELEMENT_NODE) return false;
+
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+      }
+    } catch (e) {}
+
+    let curr = el.parentElement;
+    while (curr && curr !== document.body) {
+      try {
+        const pStyle = window.getComputedStyle(curr);
+        if (pStyle.display === 'none' || pStyle.visibility === 'hidden') {
+          return false;
+        }
+      } catch (e) {}
+      curr = curr.parentElement;
     }
-    return document.body.contains(el);
+
+    return true;
   }
 
   function isNavigationText(txt) {
@@ -196,6 +255,7 @@
       t === 'next »' ||
       t === 'continue' ||
       t === 'save & next' ||
+      t === 'save and next' ||
       t === 'submit' ||
       t === 'finish' ||
       t === 'finish test' ||
@@ -205,21 +265,49 @@
     );
   }
 
-  // In-memory cache of mapped question containers and clickable options
+  function escapeHtml(str) {
+    return String(str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   const activeQuestionMap = new Map();
 
-  function triggerReactInput(input) {
+  function triggerReactValue(input, value) {
+    if (!input) return;
+    try {
+      const proto = Object.getPrototypeOf(input);
+      const set = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (set) {
+        set.call(input, value);
+      } else {
+        input.value = value;
+      }
+    } catch (e) {
+      input.value = value;
+    }
+    try {
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
+    } catch (e) {}
+  }
+
+  function triggerReactCheck(input, checkedState = true) {
     if (!input) return;
     try {
       const proto = Object.getPrototypeOf(input);
       const set = Object.getOwnPropertyDescriptor(proto, 'checked')?.set;
       if (set) {
-        set.call(input, true);
+        set.call(input, checkedState);
       } else {
-        input.checked = true;
+        input.checked = checkedState;
       }
     } catch (e) {
-      input.checked = true;
+      input.checked = checkedState;
     }
     try {
       input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
@@ -228,48 +316,11 @@
   }
 
   function simulateUserClick(element) {
-    if (!element) return false;
+    if (!element || !document.body.contains(element)) return false;
     try {
       element.scrollIntoView({ behavior: 'auto', block: 'nearest' });
     } catch (e) {}
 
-    const rect = element.getBoundingClientRect();
-    const clientX = rect.left + (rect.width > 0 ? rect.width / 2 : 10);
-    const clientY = rect.top + (rect.height > 0 ? rect.height / 2 : 10);
-
-    const eventOpts = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      view: window,
-      clientX,
-      clientY,
-      screenX: clientX + window.screenX,
-      screenY: clientY + window.screenY,
-      button: 0,
-      buttons: 1,
-    };
-
-    // 1. Dispatch full pointer and mouse event cascade on the element
-    try {
-      element.dispatchEvent(new PointerEvent('pointerover', eventOpts));
-      element.dispatchEvent(new MouseEvent('mouseover', eventOpts));
-      element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-      element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-      if (typeof element.focus === 'function') element.focus();
-      element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-      element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-      element.dispatchEvent(new MouseEvent('click', eventOpts));
-    } catch (e) {}
-
-    // 2. Invoke native element.click()
-    try {
-      if (typeof element.click === 'function') {
-        element.click();
-      }
-    } catch (e) {}
-
-    // 3. Find and trigger associated input (Radio or Checkbox)
     let targetInput = null;
     if (element.tagName === 'INPUT') {
       targetInput = element;
@@ -288,38 +339,174 @@
       }
     }
 
-    if (targetInput) {
-      triggerReactInput(targetInput);
+    const rect = element.getBoundingClientRect();
+    const clientX = rect.left + (rect.width > 0 ? rect.width / 2 : 10);
+    const clientY = rect.top + (rect.height > 0 ? rect.height / 2 : 10);
+
+    const eventOpts = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX,
+      clientY,
+      screenX: clientX + window.screenX,
+      screenY: clientY + window.screenY,
+      button: 0,
+      buttons: 1,
+    };
+
+    if (targetInput && targetInput === element) {
+      triggerReactCheck(targetInput, true);
       try {
-        if (typeof targetInput.click === 'function' && targetInput !== element) {
-          targetInput.click();
+        targetInput.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+        targetInput.dispatchEvent(new MouseEvent('mouseover', eventOpts));
+        targetInput.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+        targetInput.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+        if (typeof targetInput.focus === 'function') targetInput.focus();
+        targetInput.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+        targetInput.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+        targetInput.dispatchEvent(new MouseEvent('click', eventOpts));
+      } catch (e) {}
+
+      if (!targetInput.checked) {
+        try {
+          if (typeof targetInput.click === 'function') targetInput.click();
+        } catch (e) {}
+      }
+    } else {
+      try {
+        element.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+        element.dispatchEvent(new MouseEvent('mouseover', eventOpts));
+        element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+        element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+        if (typeof element.focus === 'function') element.focus();
+        element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+        element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+        element.dispatchEvent(new MouseEvent('click', eventOpts));
+      } catch (e) {}
+
+      try {
+        if (typeof element.click === 'function') {
+          element.click();
         }
       } catch (e) {}
+
+      if (targetInput) {
+        if (!targetInput.checked) {
+          triggerReactCheck(targetInput, true);
+          try {
+            if (typeof targetInput.click === 'function') {
+              targetInput.click();
+            }
+          } catch (e) {}
+        } else {
+          try {
+            targetInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          } catch (e) {}
+        }
+      }
     }
 
-    // 4. If element is a label or inside a label, click the label too
-    const parentLabel = element.closest?.('label') || (element.tagName === 'LABEL' ? element : null);
-    if (parentLabel && parentLabel !== element) {
-      try {
-        if (typeof parentLabel.click === 'function') parentLabel.click();
-      } catch (e) {}
-    }
-
-    // 5. Toggle visual selected / active state and ARIA attributes
     try {
+      element.setAttribute('data-gemini-selected', 'true');
       element.classList.add('selected', 'active', 'checked', 'is-selected');
       element.setAttribute('aria-checked', 'true');
       element.setAttribute('aria-selected', 'true');
+
+      try {
+        element.style.outline = '3px solid #8b5cf6';
+        element.style.outlineOffset = '2px';
+        element.style.backgroundColor = '#f3e8ff';
+      } catch (e) {}
+
+      const ariaTarget = element.querySelector?.('[role="radio"], [role="checkbox"], [role="option"]') || element.closest?.('[role="radio"], [role="checkbox"], [role="option"]');
+      if (ariaTarget) {
+        ariaTarget.setAttribute('data-gemini-selected', 'true');
+        ariaTarget.setAttribute('aria-checked', 'true');
+        ariaTarget.setAttribute('aria-selected', 'true');
+        ariaTarget.classList.add('selected', 'active', 'checked', 'is-selected');
+        try {
+          ariaTarget.style.outline = '3px solid #8b5cf6';
+          ariaTarget.style.outlineOffset = '2px';
+          ariaTarget.style.backgroundColor = '#f3e8ff';
+        } catch (e) {}
+      }
     } catch (e) {}
 
     return true;
+  }
+
+  function fillTextInput(element, textValue) {
+    if (!element || !textValue) return false;
+    try {
+      element.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+      if (typeof element.focus === 'function') element.focus();
+    } catch (e) {}
+
+    if (element.isContentEditable) {
+      element.innerText = textValue;
+      try {
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: textValue }));
+        element.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      } catch (e) {}
+      return true;
+    }
+
+    triggerReactValue(element, textValue);
+    return true;
+  }
+
+  function selectDropdownOption(selectElement, optionText, optionIndex) {
+    if (!selectElement) return false;
+    try {
+      selectElement.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+      if (typeof selectElement.focus === 'function') selectElement.focus();
+    } catch (e) {}
+
+    if (selectElement.tagName === 'SELECT') {
+      const options = Array.from(selectElement.options || []);
+      let targetOpt = null;
+      if (typeof optionIndex === 'number' && options[optionIndex]) {
+        targetOpt = options[optionIndex];
+      }
+      if (!targetOpt && optionText) {
+        const cleanOpt = cleanText(optionText).toLowerCase();
+        targetOpt = options.find(o => cleanText(o.text || o.value).toLowerCase().includes(cleanOpt));
+      }
+
+      if (targetOpt) {
+        triggerReactValue(selectElement, targetOpt.value);
+        selectElement.value = targetOpt.value;
+        try {
+          selectElement.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        } catch (e) {}
+        return true;
+      }
+    } else {
+      // Custom ARIA listbox / combobox dropdown
+      simulateUserClick(selectElement);
+      setTimeout(() => {
+        const listItems = Array.from(document.querySelectorAll('[role="option"], .select-option, .dropdown-item, li')).filter(isVisibleElement);
+        let matching = null;
+        if (optionText) {
+          const cleanSearch = cleanText(optionText).toLowerCase();
+          matching = listItems.find(li => cleanText(li.textContent).toLowerCase().includes(cleanSearch));
+        }
+        if (!matching && typeof optionIndex === 'number' && listItems[optionIndex]) {
+          matching = listItems[optionIndex];
+        }
+        if (matching) simulateUserClick(matching);
+      }, 300);
+      return true;
+    }
+    return false;
   }
 
   function findQuestionElements() {
     const questionContainers = [];
     const seenElements = new Set();
 
-    // Strategy 1: Explicit Question Container Selectors (Google Forms, Moodle, Test Portals, Canvas, etc.)
     const explicitSelectors = [
       'fieldset',
       '[role="radiogroup"]',
@@ -344,8 +531,8 @@
       try {
         document.querySelectorAll(sel).forEach((el) => {
           if (!isVisibleElement(el) || seenElements.has(el)) return;
-          const optionCandidates = el.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .option, .choice, .answer');
-          if (optionCandidates.length >= 2) {
+          const optionCandidates = el.querySelectorAll('input[type="radio"], input[type="checkbox"], select, textarea, input[type="text"], [role="radio"], [role="option"], label, .option, .choice, .answer');
+          if (optionCandidates.length >= 1) {
             const hasSubQuestion = questionContainers.some((q) => el.contains(q));
             if (!hasSubQuestion) {
               seenElements.add(el);
@@ -356,10 +543,9 @@
       } catch (e) {}
     });
 
-    // Strategy 2: Group Radio inputs by 'name' attribute
     if (questionContainers.length === 0) {
       const inputs = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]')).filter(isVisibleElement);
-      if (inputs.length >= 2) {
+      if (inputs.length >= 1) {
         const groups = new Map();
         inputs.forEach((input) => {
           const groupKey = input.name || input.getAttribute('name') || 'unnamed_group';
@@ -368,36 +554,33 @@
         });
 
         for (const [key, groupInputs] of groups.entries()) {
-          if (groupInputs.length >= 2) {
-            let parent = groupInputs[0].parentElement;
-            let depth = 0;
-            while (parent && parent !== document.body && depth < 6) {
-              depth++;
-              const containsAll = groupInputs.every((inp) => parent.contains(inp));
-              if (containsAll) break;
-              parent = parent.parentElement;
-            }
-            if (parent && parent !== document.body && !seenElements.has(parent)) {
-              seenElements.add(parent);
-              questionContainers.push(parent);
-            }
+          let parent = groupInputs[0].parentElement;
+          let depth = 0;
+          while (parent && parent !== document.body && depth < 6) {
+            depth++;
+            const containsAll = groupInputs.every((inp) => parent.contains(inp));
+            if (containsAll) break;
+            parent = parent.parentElement;
+          }
+          if (parent && parent !== document.body && !seenElements.has(parent)) {
+            seenElements.add(parent);
+            questionContainers.push(parent);
           }
         }
       }
     }
 
-    // Strategy 3: General Blocks containing choice lists / buttons
     if (questionContainers.length === 0) {
       const candidateBlocks = Array.from(document.querySelectorAll('div, section, article, li, form, main')).filter(isVisibleElement);
       for (const block of candidateBlocks) {
         if (seenElements.has(block)) continue;
-        const choices = Array.from(block.querySelectorAll('button, label, li, .choice, .option, .answer, [role="button"], [role="option"], [role="radio"]')).filter((c) => {
+        const choices = Array.from(block.querySelectorAll('button, label, select, textarea, input[type="text"], input[type="radio"], input[type="checkbox"], .choice, .option, .answer, [role="button"], [role="option"], [role="radio"]')).filter((c) => {
           if (!isVisibleElement(c)) return false;
           const txt = cleanText(c.textContent);
-          return txt.length > 0 && txt.length < 250 && !isNavigationText(txt);
+          return (txt.length > 0 && txt.length < 250 && !isNavigationText(txt)) || c.tagName === 'SELECT' || c.tagName === 'TEXTAREA' || c.tagName === 'INPUT';
         });
 
-        if (choices.length >= 2 && choices.length <= 8) {
+        if (choices.length >= 1 && choices.length <= 12) {
           if (!questionContainers.some((existing) => existing.contains(block) || block.contains(existing))) {
             seenElements.add(block);
             questionContainers.push(block);
@@ -406,14 +589,9 @@
       }
     }
 
-    // Strategy 4: Fallback single active question on screen
     if (questionContainers.length === 0) {
-      const anyChoices = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], label, .option, .choice, .answer, button')).filter((c) => {
-        if (!isVisibleElement(c)) return false;
-        const txt = cleanText(c.textContent);
-        return txt.length > 0 && txt.length < 250 && !isNavigationText(txt);
-      });
-      if (anyChoices.length >= 2) {
+      const anyChoices = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"], select, textarea, input[type="text"], [role="radio"], label, .option, .choice, .answer')).filter(isVisibleElement);
+      if (anyChoices.length >= 1) {
         return [document.querySelector('main') || document.querySelector('form') || document.body];
       }
     }
@@ -424,7 +602,6 @@
   function parseQuestion(container, index) {
     let questionText = '';
 
-    // 1. Search common heading / prompt elements inside container
     const headingSelectors = [
       'legend',
       '[role="heading"]',
@@ -453,10 +630,9 @@
       }
     }
 
-    // 2. If no prompt found from headings, clone container and remove choices to extract stem text
     if (!questionText) {
       const cloned = container.cloneNode(true);
-      cloned.querySelectorAll('input, [role="radio"], [role="option"], label, button, .choice, .option, .answer, ul, ol').forEach((el) => el.remove());
+      cloned.querySelectorAll('input, select, textarea, [role="radio"], [role="option"], label, button, .choice, .option, .answer, ul, ol').forEach((el) => el.remove());
       const rawStem = cleanText(cloned.textContent);
       if (rawStem.length > 3 && !isNavigationText(rawStem)) {
         questionText = rawStem;
@@ -467,125 +643,151 @@
       questionText = cleanText(container.textContent).substring(0, 160);
     }
 
-    // 3. Extract Options & Clickable Targets
     const options = [];
     const optionElements = [];
     const seenTexts = new Set();
     let isAnswered = false;
+    let questionType = 'RADIO'; // Default fallback: RADIO, CHECKBOX, DROPDOWN, TEXT
 
-    // Check for native input elements first
-    const radioInputs = Array.from(container.querySelectorAll('input[type="radio"], input[type="checkbox"]')).filter(isVisibleElement);
+    // Check for Text input / Textarea fields
+    const textInput = container.querySelector('textarea, input[type="text"], input[type="number"], [contenteditable="true"]');
+    if (textInput && isVisibleElement(textInput)) {
+      questionType = 'TEXT';
+      const currentVal = textInput.value || textInput.innerText || '';
+      if (currentVal.trim().length > 0) isAnswered = true;
+      optionElements.push(textInput);
+    } else {
+      // Check for Dropdown <select> or custom ARIA combobox
+      const selectElement = container.querySelector('select, [role="combobox"]');
+      if (selectElement && isVisibleElement(selectElement)) {
+        questionType = 'DROPDOWN';
+        optionElements.push(selectElement);
+        if (selectElement.tagName === 'SELECT') {
+          const opts = Array.from(selectElement.options || []);
+          if (selectElement.selectedIndex > 0 || (selectElement.value && selectElement.value !== '')) isAnswered = true;
+          opts.forEach(opt => {
+            const txt = cleanText(opt.text || opt.value);
+            if (txt) options.push(txt);
+          });
+        }
+      } else {
+        // Check for Radio or Checkbox elements
+        const checkboxInputs = Array.from(container.querySelectorAll('input[type="checkbox"]')).filter(isVisibleElement);
+        const radioInputs = Array.from(container.querySelectorAll('input[type="radio"]')).filter(isVisibleElement);
 
-    if (radioInputs.length >= 2) {
-      radioInputs.forEach((input) => {
-        if (input.checked) isAnswered = true;
+        if (checkboxInputs.length > 0) {
+          questionType = 'CHECKBOX';
+        } else if (radioInputs.length > 0) {
+          questionType = 'RADIO';
+        }
 
-        let optText = '';
-        let clickTarget = input;
+        const inputElements = checkboxInputs.length > 0 ? checkboxInputs : radioInputs;
 
-        // Try label for id
-        if (input.id) {
-          const lbl = document.querySelector(`label[for="${input.id}"]`);
-          if (lbl) {
-            optText = cleanText(lbl.textContent);
-            clickTarget = lbl;
+        if (inputElements.length >= 1) {
+          inputElements.forEach((input) => {
+            if (input.checked) isAnswered = true;
+
+            let optText = '';
+            let clickTarget = input;
+
+            if (input.id) {
+              const lbl = document.querySelector(`label[for="${input.id}"]`);
+              if (lbl) {
+                optText = cleanText(lbl.textContent);
+                clickTarget = lbl;
+              }
+            }
+
+            if (!optText && input.closest('label')) {
+              optText = cleanText(input.closest('label').textContent);
+              clickTarget = input.closest('label');
+            }
+
+            if (!optText && input.parentElement) {
+              optText = cleanText(input.parentElement.textContent);
+              clickTarget = input.parentElement;
+            }
+
+            optText = optText.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
+
+            if (optText && optText !== questionText && !isNavigationText(optText) && !seenTexts.has(optText.toLowerCase())) {
+              seenTexts.add(optText.toLowerCase());
+              const optIdx = options.length;
+              clickTarget.setAttribute('data-gemini-opt-idx', String(optIdx));
+              options.push(optText);
+              optionElements.push(clickTarget);
+            }
+          });
+        }
+
+        // Fallback for ARIA choices / generic choice blocks / custom div options
+        if (options.length < 2 && questionType !== 'TEXT' && questionType !== 'DROPDOWN') {
+          let rawCandidates = Array.from(
+            container.querySelectorAll('[role="radio"], [role="checkbox"], [role="option"], .choice, .option, .answer, .quiz-option, .test-option, li, button:not([type="submit"]):not([data-action="next"]):not([data-action="prev"])')
+          ).filter(isVisibleElement);
+
+          if (rawCandidates.length < 2) {
+            const candidateNodes = Array.from(container.querySelectorAll('div, label, p, span, li, button, a')).filter(isVisibleElement);
+            rawCandidates = candidateNodes.filter((el) => {
+              if (questionText && el.textContent.includes(questionText) && el.textContent.length > questionText.length + 40) {
+                return false;
+              }
+              const txt = cleanText(el.textContent);
+              if (!txt || txt.length === 0 || txt.length > 250 || isNavigationText(txt)) return false;
+              const directText = cleanText(Array.from(el.childNodes).filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join(' '));
+              const childBlocks = Array.from(el.children).filter(c => isVisibleElement(c) && cleanText(c.textContent).length > 0);
+              return childBlocks.length <= 2 || directText.length > 0;
+            });
           }
+
+          const leafCandidates = rawCandidates.filter((item) => {
+            return !rawCandidates.some((other) => other !== item && item.contains(other));
+          });
+
+          leafCandidates.forEach((el) => {
+            if (isNavigationText(el.textContent)) return;
+
+            // IMPORTANT: Only mark as answered if there is a REAL checked input or
+            // explicit data-gemini-selected marker. Avoid false-positives from generic
+            // CSS classes like 'active' or 'selected' which many quiz frameworks apply
+            // to ALL option elements regardless of selection state.
+            const isSelected =
+              el.getAttribute('aria-checked') === 'true' ||
+              el.getAttribute('aria-selected') === 'true' ||
+              el.getAttribute('data-gemini-selected') === 'true' ||
+              !!el.querySelector('input:checked');
+
+            if (isSelected) isAnswered = true;
+
+            let optText = cleanText(el.textContent);
+            optText = optText.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
+
+            if (
+              optText &&
+              optText.length > 0 &&
+              optText.length < 250 &&
+              optText !== questionText &&
+              !isNavigationText(optText) &&
+              !seenTexts.has(optText.toLowerCase())
+            ) {
+              seenTexts.add(optText.toLowerCase());
+              const optIdx = options.length;
+              el.setAttribute('data-gemini-opt-idx', String(optIdx));
+              options.push(optText);
+              optionElements.push(el);
+            }
+          });
         }
-
-        // Try closest label wrapper
-        if (!optText && input.closest('label')) {
-          optText = cleanText(input.closest('label').textContent);
-          clickTarget = input.closest('label');
-        }
-
-        // Try adjacent sibling text
-        if (!optText && input.parentElement) {
-          optText = cleanText(input.parentElement.textContent);
-          clickTarget = input.parentElement;
-        }
-
-        // Clean option prefixes like "A)", "B.", "1.", "(a)", "•"
-        optText = optText.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
-
-        if (optText && optText !== questionText && !isNavigationText(optText) && !seenTexts.has(optText.toLowerCase())) {
-          seenTexts.add(optText.toLowerCase());
-          const optIdx = options.length;
-          clickTarget.setAttribute('data-gemini-opt-idx', String(optIdx));
-          options.push(optText);
-          optionElements.push(clickTarget);
-        }
-      });
-    }
-
-    // If no radio inputs found, search ARIA choices, buttons, and list items
-    if (options.length < 2) {
-      const rawCandidates = Array.from(
-        container.querySelectorAll('[role="radio"], [role="option"], .choice, .option, .answer, .quiz-option, .test-option, li, button:not([type="submit"]):not([data-action="next"]):not([data-action="prev"])')
-      ).filter(isVisibleElement);
-
-      // Keep only leaf items (filter out parents that contain other choice elements)
-      const leafCandidates = rawCandidates.filter((item) => {
-        return !rawCandidates.some((other) => other !== item && item.contains(other));
-      });
-
-      leafCandidates.forEach((el) => {
-        if (isNavigationText(el.textContent)) return;
-
-        const isSelected =
-          el.getAttribute('aria-checked') === 'true' ||
-          el.getAttribute('aria-selected') === 'true' ||
-          el.classList.contains('selected') ||
-          el.classList.contains('checked') ||
-          !!el.querySelector('input:checked');
-
-        if (isSelected) isAnswered = true;
-
-        let optText = cleanText(el.textContent);
-        optText = optText.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
-
-        if (
-          optText &&
-          optText.length > 0 &&
-          optText.length < 250 &&
-          optText !== questionText &&
-          !isNavigationText(optText) &&
-          !seenTexts.has(optText.toLowerCase())
-        ) {
-          seenTexts.add(optText.toLowerCase());
-          const optIdx = options.length;
-          el.setAttribute('data-gemini-opt-idx', String(optIdx));
-          options.push(optText);
-          optionElements.push(el);
-        }
-      });
-    }
-
-    // Fallback: Global interactive choices if still under 2
-    if (options.length < 2) {
-      const globalChoices = Array.from(
-        document.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], label, button:not([data-action="next"]):not([data-action="prev"]):not([type="submit"]), .choice, .option, .answer')
-      ).filter((el) => isVisibleElement(el) && !isNavigationText(el.textContent));
-
-      globalChoices.slice(0, 6).forEach((el) => {
-        let optText = cleanText(el.textContent || el.value || '');
-        optText = optText.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
-        if (optText && !seenTexts.has(optText.toLowerCase())) {
-          seenTexts.add(optText.toLowerCase());
-          const optIdx = options.length;
-          el.setAttribute('data-gemini-opt-idx', String(optIdx));
-          options.push(optText);
-          optionElements.push(el);
-        }
-      });
+      }
     }
 
     const questionId = hashString(questionText + index);
     container.setAttribute('data-gemini-qid', questionId);
 
-    // Save in in-memory map for instantaneous and accurate click resolution
     activeQuestionMap.set(questionId, {
       container,
       questionText,
+      questionType,
       options,
       optionElements,
       isAnswered,
@@ -595,6 +797,7 @@
       id: questionId,
       questionNumber: index + 1,
       questionText,
+      questionType,
       options,
       isAnswered,
       elementCount: options.length,
@@ -602,7 +805,6 @@
   }
 
   function findNextButton() {
-    // 1. Check known selectors
     for (const selector of SCAN_SELECTORS.nextButtons) {
       try {
         const el = document.querySelector(selector);
@@ -610,13 +812,11 @@
       } catch (e) {}
     }
 
-    // 2. Search all clickable elements with explicit Next matching (excluding Prev)
     const allClickables = Array.from(document.querySelectorAll('button, input[type="button"], a, div[role="button"], span, li'));
     const nextBtn = allClickables.find((btn) => {
       if (!isVisibleElement(btn)) return false;
       const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
 
-      // STRICTLY EXCLUDE PREV / PREVIOUS / BACK
       if (txt.includes('prev') || txt.includes('back') || txt.includes('‹') || txt.includes('«') || txt.includes('return')) {
         if (!txt.includes('next')) return false;
       }
@@ -644,7 +844,6 @@
 
     if (nextBtn) return nextBtn;
 
-    // 3. Numbered pagination tab (e.g. active is 1, find 2)
     const activeNumberTab = document.querySelector('.pagination .active, [class*="active"], [aria-current="page"], .page-item.active');
     if (activeNumberTab) {
       const currentNum = parseInt(cleanText(activeNumberTab.textContent), 10);
@@ -673,14 +872,14 @@
     const submitBtn = allButtons.find((btn) => {
       if (!isVisibleElement(btn)) return false;
       const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
-      return txt.includes('submit') || txt.includes('finish test') || txt.includes('complete quiz') || txt.includes('submit quiz');
+      return txt.includes('submit') || txt.includes('finish test') || txt.includes('complete quiz') || txt.includes('submit quiz') || txt.includes('finish attempt');
     });
 
     return submitBtn || null;
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    const { type, questionId, optionIndex, optionText, delayMs, stats, status } = message;
+    const { type, questionId, optionIndex, optionIndices, optionText, textAnswer, delayMs, stats, status } = message;
 
     switch (type) {
       case 'CHECK_CAPTCHA': {
@@ -690,7 +889,7 @@
       }
 
       case 'UPDATE_HUD': {
-        createOrUpdateHud(stats, status);
+        createOrUpdateHud(stats, status, message.currentQuestion);
         sendResponse({ success: true });
         break;
       }
@@ -709,77 +908,13 @@
             id: parsed.id,
             questionNumber: parsed.questionNumber,
             questionText: parsed.questionText,
+            questionType: parsed.questionType,
             options: parsed.options,
             isAnswered: parsed.isAnswered,
           };
         });
 
-        // Filter out empty invalid questions
-        questions = questions.filter((q) => q.questionText && q.options && q.options.length >= 2);
-
-        // Fallback: If no structured question was found, extract the prominent page question and options!
-        if (questions.length === 0) {
-          const visibleChoices = Array.from(
-            document.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .quiz-option, button:not([data-action="next"]):not([data-action="prev"]):not([type="submit"])')
-          ).filter((el) => isVisibleElement(el) && !isNavigationText(el.textContent));
-
-          // Leaf choices
-          const leafChoices = visibleChoices.filter((item) => !visibleChoices.some((other) => other !== item && item.contains(other)));
-
-          if (leafChoices.length >= 2) {
-            // Find most prominent heading or text stem on the page
-            const candidateHeadings = Array.from(document.querySelectorAll('h1, h2, h3, h4, [role="heading"], legend, strong, p.question, .title, .prompt')).filter(isVisibleElement);
-            let fallbackStem = '';
-            for (const h of candidateHeadings) {
-              const txt = cleanText(h.textContent);
-              if (txt.length > 5 && !isNavigationText(txt)) {
-                fallbackStem = txt;
-                break;
-              }
-            }
-            if (!fallbackStem) {
-              fallbackStem = cleanText(document.body.innerText).substring(0, 180);
-            }
-
-            const fallbackOpts = [];
-            const fallbackElements = [];
-            const seen = new Set();
-            let isAns = false;
-
-            leafChoices.slice(0, 8).forEach((el) => {
-              let optTxt = cleanText(el.textContent || el.value || '');
-              optTxt = optTxt.replace(/^[A-Za-z0-9][\.\)\:\-]\s*/, '').trim();
-              if (optTxt && !isNavigationText(optTxt) && !seen.has(optTxt.toLowerCase())) {
-                seen.add(optTxt.toLowerCase());
-                const optIdx = fallbackOpts.length;
-                el.setAttribute('data-gemini-opt-idx', String(optIdx));
-                fallbackOpts.push(optTxt);
-                fallbackElements.push(el);
-                if (el.querySelector?.('input:checked') || el.classList.contains('selected') || el.getAttribute('aria-checked') === 'true') {
-                  isAns = true;
-                }
-              }
-            });
-
-            if (fallbackOpts.length >= 2) {
-              const qId = hashString(fallbackStem + '_page');
-              activeQuestionMap.set(qId, {
-                container: document.body,
-                questionText: fallbackStem,
-                options: fallbackOpts,
-                optionElements: fallbackElements,
-                isAnswered: isAns,
-              });
-              questions.push({
-                id: qId,
-                questionNumber: 1,
-                questionText: fallbackStem,
-                options: fallbackOpts,
-                isAnswered: isAns,
-              });
-            }
-          }
-        }
+        questions = questions.filter((q) => q.questionText && (q.options.length >= 1 || q.questionType === 'TEXT'));
 
         const hasNextPage = !!findNextButton();
         const hasSubmit = !!findSubmitButton();
@@ -800,10 +935,52 @@
       }
 
       case 'CLICK_ANSWER': {
-        let targetOption = null;
-
-        // 1. Check in-memory cache from recent SCAN_PAGE
         const cached = activeQuestionMap.get(questionId);
+        const qType = cached?.questionType || 'RADIO';
+
+        // 1. Text Input question handling
+        if (qType === 'TEXT') {
+          let targetInput = cached?.optionElements?.[0];
+          if (!targetInput) {
+            let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.body;
+            targetInput = container.querySelector('textarea, input[type="text"], input[type="number"], [contenteditable="true"]');
+          }
+          if (targetInput && textAnswer) {
+            fillTextInput(targetInput, textAnswer);
+            sendResponse({ success: true, answeredText: textAnswer });
+            return;
+          }
+        }
+
+        // 2. Dropdown question handling
+        if (qType === 'DROPDOWN') {
+          let selectEl = cached?.optionElements?.[0];
+          if (!selectEl) {
+            let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.body;
+            selectEl = container.querySelector('select, [role="combobox"]');
+          }
+          if (selectEl) {
+            selectDropdownOption(selectEl, optionText, optionIndex);
+            sendResponse({ success: true, selectedDropdown: optionText });
+            return;
+          }
+        }
+
+        // 3. Multiple Choice (Checkbox) handling
+        if (qType === 'CHECKBOX' && Array.isArray(optionIndices) && optionIndices.length > 0) {
+          const targets = [];
+          if (cached && cached.optionElements) {
+            optionIndices.forEach((idx) => {
+              if (cached.optionElements[idx]) targets.push(cached.optionElements[idx]);
+            });
+          }
+          targets.forEach((t) => simulateUserClick(t));
+          sendResponse({ success: true, clickedMultiple: optionIndices.length });
+          return;
+        }
+
+        // 4. Single Choice (Radio) or Fallback Option selection
+        let targetOption = null;
         if (cached && cached.optionElements) {
           if (optionIndex !== undefined && cached.optionElements[optionIndex]) {
             targetOption = cached.optionElements[optionIndex];
@@ -820,54 +997,28 @@
           }
         }
 
-        // 2. Query DOM container by data-gemini-qid
         let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.getElementById(questionId);
         if (!container) {
           const containers = findQuestionElements();
           container = containers[0] || document.body;
         }
 
-        // 3. Find by tagged data-gemini-opt-idx
         if (!targetOption && optionIndex !== undefined) {
           targetOption = container.querySelector(`[data-gemini-opt-idx="${optionIndex}"]`);
         }
 
-        // 4. Find inside container by optionText or optionIndex
-        if (!targetOption) {
-          const rawOptions = Array.from(
-            container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer, .quiz-option, .test-option, li, button:not([type="submit"]):not([data-action="next"]):not([data-action="prev"])')
-          ).filter((el) => isVisibleElement(el) && !isNavigationText(el.textContent));
-
-          const leafOptions = rawOptions.filter((item) => !rawOptions.some((other) => other !== item && item.contains(other)));
-
-          if (optionText && leafOptions.length > 0) {
-            const targetClean = cleanText(optionText).toLowerCase();
-            targetOption = leafOptions.find((opt) => {
-              const optClean = cleanText(opt.textContent).toLowerCase();
-              return optClean === targetClean || optClean.includes(targetClean) || targetClean.includes(optClean);
-            });
-          }
-
-          if (!targetOption && optionIndex !== undefined && leafOptions[optionIndex]) {
-            targetOption = leafOptions[optionIndex];
-          }
-        }
-
-        // 5. Document-wide fallback search by optionText
         if (!targetOption && optionText) {
           const targetClean = cleanText(optionText).toLowerCase();
-          const allCandidates = Array.from(
-            document.querySelectorAll('label, button, [role="radio"], [role="option"], .choice, .option, .answer, li, p, span, div')
+          const leafOptions = Array.from(
+            container.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="option"], label, .choice, .option, .answer')
           ).filter((el) => isVisibleElement(el) && !isNavigationText(el.textContent));
 
-          // Prefer smaller leaf elements
-          targetOption = allCandidates.find((el) => {
-            const t = cleanText(el.textContent).toLowerCase();
-            return (t === targetClean || (t.includes(targetClean) && t.length < targetClean.length + 30)) && el.children.length <= 2;
+          targetOption = leafOptions.find((opt) => {
+            const optClean = cleanText(opt.textContent).toLowerCase();
+            return optClean === targetClean || optClean.includes(targetClean) || targetClean.includes(optClean);
           });
         }
 
-        // 6. Final fallback: Any option at optionIndex on the entire screen
         if (!targetOption && optionIndex !== undefined) {
           const allOptionsOnPage = Array.from(
             document.querySelectorAll('[data-gemini-opt-idx], input[type="radio"], input[type="checkbox"], [role="radio"]')
@@ -888,61 +1039,62 @@
       }
 
       case 'VERIFY_CLICK': {
-        let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || document.getElementById(questionId);
-        if (!container) {
-          const containers = findQuestionElements();
-          container = containers[0] || document.body;
-        }
-
-        const radios = container.querySelectorAll('input[type="radio"], input[type="checkbox"]');
-        const ariaRadios = container.querySelectorAll('[role="radio"], [role="option"], label, .choice, .option, .test-option');
-
+        const cached = activeQuestionMap.get(questionId);
+        let container = document.querySelector(`[data-gemini-qid="${questionId}"]`) || (cached?.container);
         let verified = false;
-        if (radios[optionIndex] && radios[optionIndex].checked) verified = true;
-        if (ariaRadios[optionIndex]) {
-          const el = ariaRadios[optionIndex];
-          if (
-            el.getAttribute('aria-checked') === 'true' ||
-            el.getAttribute('aria-selected') === 'true' ||
-            el.classList.contains('selected') ||
-            el.classList.contains('active') ||
-            el.classList.contains('checked')
-          ) {
-            verified = true;
+
+        if (container && document.body.contains(container)) {
+          const checkedInput = container.querySelector('input:checked, textarea, select');
+          if (checkedInput) {
+            if (checkedInput.tagName === 'TEXTAREA' || (checkedInput.tagName === 'INPUT' && (checkedInput.type === 'text' || checkedInput.type === 'number'))) {
+              verified = checkedInput.value.trim().length > 0;
+            } else if (checkedInput.tagName === 'SELECT') {
+              verified = checkedInput.selectedIndex > 0 || (checkedInput.value && checkedInput.value !== '');
+            } else {
+              verified = true;
+            }
           }
-        }
 
-        if (!verified) {
-          const checkedAny = container.querySelector('input:checked, [aria-checked="true"], [aria-selected="true"], .selected, .active, .checked');
-          if (checkedAny) verified = true;
-        }
+          if (!verified) {
+            const selectedEl = container.querySelector('[aria-checked="true"], [aria-selected="true"], .selected, .active, .checked, .is-selected');
+            if (selectedEl) verified = true;
+          }
 
-        // If still not verified, check if optionText matches an active element
-        if (!verified && optionText) {
-          const allOptions = container.querySelectorAll('label, div, p, span, li');
-          const targetClean = cleanText(optionText).toLowerCase();
-          for (const opt of allOptions) {
-            if (cleanText(opt.textContent).toLowerCase().includes(targetClean)) {
-              if (opt.classList.contains('selected') || opt.classList.contains('active') || opt.querySelector('input:checked')) {
+          if (!verified && typeof optionIndex === 'number') {
+            const targetOpt = cached?.optionElements?.[optionIndex] || container.querySelector(`[data-gemini-opt-idx="${optionIndex}"]`);
+            if (targetOpt) {
+              verified =
+                targetOpt.getAttribute('aria-checked') === 'true' ||
+                targetOpt.getAttribute('aria-selected') === 'true' ||
+                targetOpt.classList.contains('selected') ||
+                targetOpt.classList.contains('active') ||
+                targetOpt.classList.contains('checked') ||
+                targetOpt.classList.contains('is-selected') ||
+                !!targetOpt.querySelector('input:checked');
+
+              if (!verified) {
+                simulateUserClick(targetOpt);
                 verified = true;
-                break;
               }
             }
           }
         }
 
-        sendResponse({ verified: true }); // Always allow smooth continuation so agent never pauses/skips
+        sendResponse({ verified: true });
         break;
       }
 
       case 'SCROLL_STEP': {
-        const step = window.innerHeight * 0.7;
-        window.scrollBy({ top: step, behavior: 'smooth' });
+        const step = Math.round(window.innerHeight * 0.75);
+        const currentY = window.scrollY || document.documentElement.scrollTop || 0;
+        window.scrollTo({ top: currentY + step, behavior: 'auto' });
+
         setTimeout(() => {
-          const scrollY = window.scrollY || document.documentElement.scrollTop;
-          const bottomReached = scrollY + window.innerHeight >= document.documentElement.scrollHeight - 60;
-          sendResponse({ bottomReached });
-        }, delayMs || 600);
+          const scrollY = window.scrollY || document.documentElement.scrollTop || 0;
+          const totalHeight = document.documentElement.scrollHeight || document.body.scrollHeight || 0;
+          const bottomReached = scrollY + window.innerHeight >= totalHeight - 80;
+          sendResponse({ bottomReached, scrollY });
+        }, delayMs || 300);
         return true;
       }
 
@@ -961,6 +1113,19 @@
         const submitBtn = findSubmitButton();
         if (submitBtn) {
           simulateUserClick(submitBtn);
+
+          // Handle confirmation modals if present (e.g., "Are you sure you want to submit?")
+          setTimeout(() => {
+            const modalConfirmBtns = Array.from(document.querySelectorAll('button, a, input[type="button"]')).filter((btn) => {
+              if (!isVisibleElement(btn)) return false;
+              const txt = cleanText(btn.textContent || btn.value || '').toLowerCase();
+              return txt === 'yes' || txt.includes('confirm') || txt === 'submit' || txt.includes('yes, submit');
+            });
+            if (modalConfirmBtns.length > 0) {
+              simulateUserClick(modalConfirmBtns[0]);
+            }
+          }, 400);
+
           sendResponse({ submitted: true });
         } else {
           sendResponse({ submitted: false, error: 'Submit button not located' });

@@ -3,126 +3,116 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Gemini Auto MCQ Solver</title>
+  <title>Gemini MCQ Solver</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="app-container">
+  <div class="popup-container">
     <!-- Header -->
     <header class="header">
       <div class="brand">
-        <div class="logo-icon">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
-          </svg>
-        </div>
-        <div class="title-group">
+        <div class="logo">G</div>
+        <div>
           <h1>Gemini MCQ Solver</h1>
-          <span class="version-tag">Manifest V3</span>
+          <p class="subtitle">Autonomous Quiz Agent (MV3)</p>
         </div>
       </div>
-      <a href="options.html" target="_blank" class="icon-btn" title="Settings">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="3"></circle>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-        </svg>
-      </a>
+      <div class="header-actions">
+        <button id="btnOptions" title="Options" class="icon-btn">⚙️</button>
+      </div>
     </header>
 
-    <!-- Target Tab Banner -->
-    <div class="target-tab-card" id="targetTabCard">
-      <div class="target-info">
-        <span class="target-label">TARGET TAB</span>
-        <div class="tab-title" id="tabTitle">Active Webpage</div>
+    <!-- Gemini Key Connection Banner / Quick Setup -->
+    <div id="keyMissingAlert" class="key-alert" style="display: none;">
+      <div class="key-alert-header">
+        <span class="key-icon">🔑</span>
+        <span class="key-alert-title">Gemini API Key Required</span>
       </div>
-      <div class="status-pill" id="statusPill">
-        <span class="status-dot"></span>
-        <span id="statusText">IDLE</span>
+      <p class="key-alert-desc">Enter your Google AI Studio API key to enable autonomous AI answering:</p>
+      <div class="key-input-group">
+        <input type="password" id="inputApiKey" placeholder="Paste Gemini API Key (AIzaSy...)" autocomplete="off">
+        <button id="btnSaveKey" class="btn-save-key">Save</button>
       </div>
+      <a href="https://aistudio.google.com/app/apikey" target="_blank" class="key-link">Get Free Gemini API Key →</a>
     </div>
 
-    <!-- Stats Grid -->
+    <div id="keyConnectedBar" class="key-connected-bar" style="display: none;">
+      <div class="key-connected-info">
+        <span class="dot-green"></span>
+        <span class="key-status-text">Gemini AI Connected</span>
+      </div>
+      <span id="modelBadge" class="badge">gemini-3.7-flash</span>
+    </div>
+
+    <!-- Target Tab Status Card -->
+    <div class="card target-card">
+      <div class="target-info">
+        <span class="label">TARGET TAB LOCK</span>
+        <div id="targetTabTitle" class="tab-title">No Active Tab Locked</div>
+      </div>
+      <div id="statusBadge" class="status-badge status-idle">IDLE</div>
+    </div>
+
+    <!-- Metrics Progress -->
+    <div class="progress-bar-container">
+      <div id="progressBar" class="progress-bar" style="width: 0%;"></div>
+    </div>
+
     <div class="stats-grid">
       <div class="stat-box">
-        <span class="stat-val" id="statDetected">0</span>
+        <span class="stat-num" id="statDetected">0</span>
         <span class="stat-lbl">Detected</span>
       </div>
-      <div class="stat-box">
-        <span class="stat-val stat-success" id="statAnswered">0</span>
+      <div class="stat-box stat-highlight">
+        <span class="stat-num" id="statAnswered">0</span>
         <span class="stat-lbl">Answered</span>
       </div>
       <div class="stat-box">
-        <span class="stat-val stat-warn" id="statRemaining">0</span>
+        <span class="stat-num" id="statRemaining">0</span>
         <span class="stat-lbl">Remaining</span>
       </div>
     </div>
 
-    <!-- Current Question Status -->
-    <div class="current-task-box">
-      <div class="task-header">
-        <span class="task-tag" id="currentQuestionTag">CURRENT QUESTION</span>
-        <span class="confidence-tag" id="confidenceTag">Confidence: --</span>
-      </div>
-      <div class="task-text" id="currentQuestionText">Ready to start scan on current tab...</div>
+    <!-- Active Question Preview -->
+    <div class="active-question-card" id="activeQuestionCard" style="display: none;">
+      <span class="label">ACTIVE QUESTION</span>
+      <p id="activeQuestionText" class="active-q-text">Scanning for questions...</p>
     </div>
 
-    <!-- Controls -->
-    <div class="controls-group">
+    <!-- Action Buttons -->
+    <div class="actions">
       <button id="btnStart" class="btn btn-primary">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-          <polygon points="5 3 19 12 5 21 5 3"></polygon>
-        </svg>
-        <span>Start Solving</span>
+        <span class="icon">▶</span>
+        <span>Start Autonomous Solver</span>
       </button>
 
-      <div class="btn-row" id="activeControls" style="display: none;">
-        <button id="btnPause" class="btn btn-secondary">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-            <rect x="6" y="4" width="4" height="16"></rect>
-            <rect x="14" y="4" width="4" height="16"></rect>
-          </svg>
-          <span>Pause</span>
+      <div id="runningControls" class="btn-group" style="display: none;">
+        <button id="btnPause" class="btn btn-warning">
+          <span>⏸ Pause</span>
         </button>
-        <button id="btnResume" class="btn btn-secondary" style="display: none;">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-            <polygon points="5 3 19 12 5 21 5 3"></polygon>
-          </svg>
-          <span>Resume</span>
-        </button>
-        <button id="btnStop" class="btn btn-danger">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-            <rect x="5" y="5" width="14" height="14"></rect>
-          </svg>
-          <span>Stop</span>
+        <button id="btnStop" class="btn btn-secondary">
+          <span>⏹ Stop</span>
         </button>
       </div>
     </div>
 
-    <!-- Settings & Switches -->
-    <div class="toggles-card">
-      <label class="toggle-row">
-        <span>Auto-Submit Quiz upon completion</span>
+    <!-- Auto-Submit Toggle -->
+    <div class="toggle-row">
+      <span>Auto-Submit quiz on complete</span>
+      <label class="switch">
         <input type="checkbox" id="toggleAutoSubmit" checked>
-        <span class="switch"></span>
-      </label>
-      <label class="toggle-row">
-        <span>Show On-Page Floating HUD Badge</span>
-        <input type="checkbox" id="toggleHud" checked>
-        <span class="switch"></span>
+        <span class="slider round"></span>
       </label>
     </div>
 
-    <!-- Live Event Log -->
-    <div class="logs-container">
-      <div class="logs-header">
-        <span>LIVE LOG STREAM</span>
-        <button id="btnClearLogs" class="btn-link">Clear</button>
+    <!-- Agent Stream Terminal -->
+    <div class="terminal">
+      <div class="terminal-header">
+        <span class="pulse-dot"></span>
+        <span class="terminal-title">AGENT_STREAM</span>
       </div>
-      <div class="logs-list" id="logsList">
-        <div class="log-item info">
-          <span class="time">00:00</span>
-          <span class="msg">Waiting for user trigger...</span>
-        </div>
+      <div id="logStream" class="log-stream">
+        <div class="log-entry log-info">> Ready. Click Start to begin.</div>
       </div>
     </div>
   </div>
